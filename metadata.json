@@ -1,0 +1,5 @@
+{
+  "name": "Zuddl Blog Thumbnail Generator",
+  "description": "Experimental app for Zuddl's blog thumbnail generation.",
+  "requestFramePermissions": []
+}
