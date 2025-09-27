@@ -95,34 +95,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       ...rest,
     };
 
-    const rawModelId = (model || DEFAULT_MODEL).trim();
-    if (!rawModelId) {
+    const normalizedModelId = (model || DEFAULT_MODEL)
+      .trim()
+      .replace(/\u2013|\u2014/g, '-');
+
+    if (!normalizedModelId) {
       res.status(400).json({ error: 'Model ID must be a non-empty string.' });
       return;
     }
 
-    if (/\s/.test(rawModelId)) {
-      res.status(400).json({ error: 'Model ID must not contain spaces.' });
+    if (!/^[a-z0-9._-]+\/[a-z0-9._-]+$/i.test(normalizedModelId)) {
+      res.status(400).json({ error: 'Invalid model id' });
       return;
     }
 
-    if (/\/\//.test(rawModelId)) {
-      res.status(400).json({ error: 'Model ID must not contain consecutive slashes.' });
-      return;
-    }
-
-    const segments = rawModelId.split('/');
-    if (segments.length !== 2) {
-      res.status(400).json({ error: 'Model ID must follow the "org/model" format.' });
-      return;
-    }
-
+    const segments = normalizedModelId.split('/');
     const [org, name] = segments;
-    if (!org || !name) {
-      res.status(400).json({ error: 'Model ID must follow the "org/model" format.' });
-      return;
-    }
-
     const url = `${HF_API_URL}/${encodeURIComponent(org)}/${encodeURIComponent(name)}`;
     const debugEnabled = (process.env.DEBUG || '').split(',').map(flag => flag.trim()).includes('hugging-face');
     if (debugEnabled) {
