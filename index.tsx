@@ -1,5 +1,5 @@
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { GoogleGenAI, Modality } from '@google/genai';
 
@@ -9,6 +9,50 @@ const getGenAIClient = () => {
     throw new Error('Missing VITE_GEMINI_API_KEY environment variable. Please configure your Gemini API key.');
   }
   return new GoogleGenAI({ apiKey });
+};
+
+type ProviderOption = 'google' | 'hugging-face';
+
+const arrayBufferToDataUrl = (buffer: ArrayBuffer, mimeType: string) => {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return `data:${mimeType};base64,${btoa(binary)}`;
+};
+
+const extractTextFromHFResponse = (data: unknown): string => {
+  if (typeof data === 'string') {
+    return data;
+  }
+
+  if (Array.isArray(data)) {
+    const texts = data
+      .map((item) => {
+        if (typeof item === 'string') return item;
+        if (item && typeof item === 'object') {
+          if (typeof (item as any).generated_text === 'string') return (item as any).generated_text;
+          if (typeof (item as any).text === 'string') return (item as any).text;
+        }
+        return JSON.stringify(item, null, 2);
+      })
+      .filter(Boolean);
+    return texts.join('\n\n');
+  }
+
+  if (data && typeof data === 'object') {
+    const maybeText = (data as any).generated_text || (data as any).text;
+    if (typeof maybeText === 'string') {
+      return maybeText;
+    }
+  }
+
+  try {
+    return JSON.stringify(data, null, 2);
+  } catch {
+    return 'Received an unsupported response format from Hugging Face.';
+  }
 };
 
 const ImagePreviewModal = ({ imageHistory, initialIndex, onClose, onDownload }) => {
@@ -102,7 +146,10 @@ const App = () => {
   const [loading, setLoading] = useState(false);
   const [regenerating, setRegenerating] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [selectedProvider, setSelectedProvider] = useState<ProviderOption>('google');
   const [selectedModel, setSelectedModel] = useState('imagen-4.0-generate-001');
+  const [huggingFaceModel, setHuggingFaceModel] = useState('stabilityai/sd-turbo');
+  const [huggingFaceOutput, setHuggingFaceOutput] = useState<string | null>(null);
   const [modalState, setModalState] = useState<{ key: string; history: string[]; index: number } | null>(null);
   
   const initialImageConfigs: ImageConfig[] = [
@@ -140,6 +187,54 @@ const App = () => {
   - **Overall Feel:** Product-centric, data-driven, clean, and user-friendly.
   `;
 
+  useEffect(() => {
+    if (selectedProvider === 'google') {
+      setHuggingFaceOutput(null);
+    }
+  }, [selectedProvider]);
+
+  const callHuggingFace = async (prompt: string) => {
+    const response = await fetch('/api/hugging-face', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt, model: huggingFaceModel }),
+    });
+
+    const contentType = response.headers.get('content-type') || '';
+
+    if (!response.ok) {
+      let message = 'Failed to contact Hugging Face.';
+      if (contentType.includes('application/json')) {
+        try {
+          const errorData = await response.json();
+          if (typeof errorData?.error === 'string') {
+            message = errorData.error;
+          }
+        } catch {
+          // ignore JSON parsing issues for error responses
+        }
+      } else {
+        const text = await response.text();
+        if (text) {
+          message = text;
+        }
+      }
+      throw new Error(message);
+    }
+
+    if (contentType.includes('application/json')) {
+      const data = await response.json();
+      if (data?.type === 'text') {
+        return { kind: 'text', payload: extractTextFromHFResponse(data.data) } as const;
+      }
+      return { kind: 'text', payload: extractTextFromHFResponse(data) } as const;
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    const mimeType = contentType || 'image/png';
+    return { kind: 'image', payload: arrayBufferToDataUrl(arrayBuffer, mimeType) } as const;
+  };
+
   const generateInitialImages = async () => {
     if (!blogContent.trim()) {
       setError('Please paste your blog content first.');
@@ -151,9 +246,10 @@ const App = () => {
     setCurrentVersions({});
 
     try {
+      if (selectedProvider === 'google') {
         const ai = getGenAIClient();
         const basePrompt = `${STYLE_PROMPT} Based on the following blog content, generate images for a tech blog. Blog Content: "${blogContent}"`;
-        
+
         const groupedByAspectRatio = imageConfigs.reduce((acc, config) => {
             const ratio = findClosestSupportedRatio(config.width, config.height);
             if (!acc[ratio]) acc[ratio] = [];
@@ -176,7 +272,7 @@ const App = () => {
                 });
             });
         }
-        
+
         const newImages: Record<string, string[]> = {};
         allGeneratedImages.forEach(({ key, src }) => newImages[key] = [src]);
         setImages(newImages);
@@ -184,6 +280,35 @@ const App = () => {
         const initialVersions: Record<string, number> = {};
         Object.keys(newImages).forEach(key => initialVersions[key] = 0);
         setCurrentVersions(initialVersions);
+        setHuggingFaceOutput(null);
+      } else {
+        const basePrompt = `${STYLE_PROMPT} Based on the following blog content, generate images for a tech blog. Blog Content: "${blogContent}"`;
+        const results: { key: string; label: string; kind: 'image' | 'text'; value: string }[] = [];
+
+        for (const config of imageConfigs) {
+          const ratio = findClosestSupportedRatio(config.width, config.height);
+          const prompt = `${basePrompt} The required aspect ratio is ${ratio} with a resolution close to ${config.width}x${config.height}.`;
+          const result = await callHuggingFace(prompt);
+          results.push({ key: config.key, label: config.title, kind: result.kind, value: result.payload });
+        }
+
+        const newImages: Record<string, string[]> = {};
+        const textSnippets: string[] = [];
+
+        results.forEach(({ key, label, kind, value }) => {
+          if (kind === 'image') {
+            newImages[key] = [value];
+          } else {
+            textSnippets.push(`${label}:\n${value}`);
+          }
+        });
+
+        setImages(newImages);
+        const initialVersions: Record<string, number> = {};
+        Object.keys(newImages).forEach(key => initialVersions[key] = 0);
+        setCurrentVersions(initialVersions);
+        setHuggingFaceOutput(textSnippets.length ? textSnippets.join('\n\n') : null);
+      }
 
     } catch (err) {
       console.error(err);
@@ -211,9 +336,10 @@ const App = () => {
     const aspectRatio = findClosestSupportedRatio(config.width, config.height);
 
     try {
+      if (selectedProvider === 'google') {
         const ai = getGenAIClient();
         let newImageSrc: string | null = null;
-        
+
         if (selectedModel === 'gemini-2.5-flash-image-preview') {
             const currentImageHistory = images[imageKey];
             const currentImageIndex = currentVersions[imageKey];
@@ -222,16 +348,16 @@ const App = () => {
             }
             const currentImageSrc = currentImageHistory[currentImageIndex];
             const base64Data = currentImageSrc.split(',')[1];
-            
+
             const imagePart = { inlineData: { data: base64Data, mimeType: 'image/png' } };
             const textPart = { text: modificationPrompt };
-            
+
             const response = await ai.models.generateContent({
                 model: 'gemini-2.5-flash-image-preview',
                 contents: { parts: [imagePart, textPart] },
                 config: { responseModalities: [Modality.IMAGE, Modality.TEXT] },
             });
-            
+
             const imagePartResponse = response.candidates?.[0]?.content?.parts?.find(part => part.inlineData);
             if (imagePartResponse?.inlineData) {
                 newImageSrc = `data:image/png;base64,${imagePartResponse.inlineData.data}`;
@@ -244,13 +370,13 @@ const App = () => {
             Original Blog Content: "${blogContent}"
             Modification Request: "${modificationPrompt}"
             The required aspect ratio is ${aspectRatio}.`;
-            
+
             const response = await ai.models.generateImages({
                 model: selectedModel, prompt, config: { numberOfImages: 1, outputMimeType: 'image/png', aspectRatio },
             });
             newImageSrc = `data:image/png;base64,${response.generatedImages[0].image.imageBytes}`;
         }
-        
+
         if (newImageSrc) {
             setImages(prev => {
                 const history = prev[imageKey] || [];
@@ -260,6 +386,30 @@ const App = () => {
             });
             setCurrentVersions(prev => ({...prev, [imageKey]: (prev[imageKey] ?? -1) + 1}));
         }
+      } else {
+        const prompt = `${STYLE_PROMPT} Regenerate an image for a tech blog based on the original content and a modification request.
+        Original Blog Content: "${blogContent}"
+        Modification Request: "${modificationPrompt}"
+        The required aspect ratio is ${aspectRatio}.`;
+
+        const result = await callHuggingFace(prompt);
+
+        if (result.kind === 'image') {
+          setImages(prev => {
+              const history = prev[imageKey] || [];
+              const newHistory = history.slice(0, (currentVersions[imageKey] ?? 0) + 1);
+              return { ...prev, [imageKey]: [...newHistory, result.payload] };
+          });
+          setCurrentVersions(prev => ({...prev, [imageKey]: (prev[imageKey] ?? -1) + 1}));
+          setHuggingFaceOutput(null);
+        } else {
+          const label = config?.title || imageKey;
+          setHuggingFaceOutput(prev => {
+            const content = `${label} response:\n${result.payload}`;
+            return prev ? `${content}\n\n${prev}` : content;
+          });
+        }
+      }
 
     } catch (err) {
         console.error(err);
@@ -286,9 +436,10 @@ const App = () => {
     const aspectRatio = findClosestSupportedRatio(config.width, config.height);
 
     try {
+      if (selectedProvider === 'google') {
         const ai = getGenAIClient();
         const prompt = `${STYLE_PROMPT} Based on the following blog content, generate an image for a tech blog. Blog Content: "${blogContent}"`;
-        
+
         const response = await ai.models.generateImages({
             model: 'imagen-4.0-generate-001',
             prompt,
@@ -302,9 +453,29 @@ const App = () => {
                 [imageKey]: [newImageSrc]
             }));
             setCurrentVersions(prev => ({...prev, [imageKey]: 0}));
+            setHuggingFaceOutput(null);
         } else {
             throw new Error("Image generation failed to return an image.");
         }
+      } else {
+        const prompt = `${STYLE_PROMPT} Based on the following blog content, generate an image for a tech blog. Blog Content: "${blogContent}". Maintain an aspect ratio close to ${aspectRatio} (${config.width}x${config.height}).`;
+        const result = await callHuggingFace(prompt);
+
+        if (result.kind === 'image') {
+          setImages(prev => ({
+              ...prev,
+              [imageKey]: [result.payload]
+          }));
+          setCurrentVersions(prev => ({...prev, [imageKey]: 0}));
+          setHuggingFaceOutput(null);
+        } else {
+          const label = config?.title || imageKey;
+          setHuggingFaceOutput(prev => {
+            const content = `${label} response:\n${result.payload}`;
+            return prev ? `${content}\n\n${prev}` : content;
+          });
+        }
+      }
 
     } catch (err) {
         console.error(err);
@@ -399,20 +570,54 @@ const App = () => {
       )}
       <h1>Zuddl Blog Thumbnail Generator</h1>
       <div className="main-controls">
-        <div className="model-selector-wrapper">
-            <label htmlFor="model-selector">Regeneration Model</label>
-            <div className="select-container">
-              <select 
-                  id="model-selector" 
-                  className="model-selector"
-                  value={selectedModel} 
-                  onChange={e => setSelectedModel(e.target.value)}
-                  disabled={loading || !!regenerating}
-              >
-                  <option value="imagen-4.0-generate-001">Imagen 4.0 (Generate)</option>
-                  <option value="gemini-2.5-flash-image-preview">Gemini 2.5 Flash (Edit)</option>
-              </select>
+        <div className="provider-row">
+          <div className="model-selector-wrapper">
+              <label htmlFor="provider-selector">AI Provider</label>
+              <div className="select-container">
+                <select
+                    id="provider-selector"
+                    className="model-selector"
+                    value={selectedProvider}
+                    onChange={e => setSelectedProvider(e.target.value as ProviderOption)}
+                    disabled={loading || !!regenerating}
+                >
+                    <option value="google">Google Gemini</option>
+                    <option value="hugging-face">Hugging Face</option>
+                </select>
+              </div>
+          </div>
+          {selectedProvider === 'google' ? (
+            <div className="model-selector-wrapper">
+              <label htmlFor="model-selector">Regeneration Model</label>
+              <div className="select-container">
+                <select
+                    id="model-selector"
+                    className="model-selector"
+                    value={selectedModel}
+                    onChange={e => setSelectedModel(e.target.value)}
+                    disabled={loading || !!regenerating}
+                >
+                    <option value="imagen-4.0-generate-001">Imagen 4.0 (Generate)</option>
+                    <option value="gemini-2.5-flash-image-preview">Gemini 2.5 Flash (Edit)</option>
+                </select>
+              </div>
             </div>
+          ) : (
+            <div className="model-selector-wrapper">
+              <label htmlFor="hf-model-input">Hugging Face Model</label>
+              <input
+                id="hf-model-input"
+                type="text"
+                className="model-input"
+                value={huggingFaceModel}
+                onChange={e => setHuggingFaceModel(e.target.value)}
+                disabled={loading || !!regenerating}
+                placeholder="stabilityai/sd-turbo"
+                aria-label="Hugging Face model name"
+              />
+              <span className="model-helper-text">Defaults to stabilityai/sd-turbo</span>
+            </div>
+          )}
         </div>
         <textarea
           className="blog-input"
@@ -425,6 +630,12 @@ const App = () => {
           {loading ? <><div className="spinner"></div><span>Generating...</span></> : 'Generate Thumbnails'}
         </button>
       </div>
+      {huggingFaceOutput && (
+        <div className="text-output-card" role="status">
+          <h2>Hugging Face Response</h2>
+          <pre>{huggingFaceOutput}</pre>
+        </div>
+      )}
       {error && <p className="error-message" role="alert">{error}</p>}
       <div className="image-grid">
         {imageConfigs.map(({ key, title, width, height, aspectClass, isRemovable }) => {
