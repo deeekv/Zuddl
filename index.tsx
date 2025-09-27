@@ -3,6 +3,14 @@ import React, { useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { GoogleGenAI, Modality } from '@google/genai';
 
+const getGenAIClient = () => {
+  const apiKey = import.meta.env.VITE_GEMINI_API_KEY as string | undefined;
+  if (!apiKey) {
+    throw new Error('Missing VITE_GEMINI_API_KEY environment variable. Please configure your Gemini API key.');
+  }
+  return new GoogleGenAI({ apiKey });
+};
+
 const ImagePreviewModal = ({ imageHistory, initialIndex, onClose, onDownload }) => {
   const [currentIndex, setCurrentIndex] = useState(initialIndex);
 
@@ -132,8 +140,6 @@ const App = () => {
   - **Overall Feel:** Product-centric, data-driven, clean, and user-friendly.
   `;
 
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY as string });
-
   const generateInitialImages = async () => {
     if (!blogContent.trim()) {
       setError('Please paste your blog content first.');
@@ -145,6 +151,7 @@ const App = () => {
     setCurrentVersions({});
 
     try {
+        const ai = getGenAIClient();
         const basePrompt = `${STYLE_PROMPT} Based on the following blog content, generate images for a tech blog. Blog Content: "${blogContent}"`;
         
         const groupedByAspectRatio = imageConfigs.reduce((acc, config) => {
@@ -204,6 +211,7 @@ const App = () => {
     const aspectRatio = findClosestSupportedRatio(config.width, config.height);
 
     try {
+        const ai = getGenAIClient();
         let newImageSrc: string | null = null;
         
         if (selectedModel === 'gemini-2.5-flash-image-preview') {
@@ -278,6 +286,7 @@ const App = () => {
     const aspectRatio = findClosestSupportedRatio(config.width, config.height);
 
     try {
+        const ai = getGenAIClient();
         const prompt = `${STYLE_PROMPT} Based on the following blog content, generate an image for a tech blog. Blog Content: "${blogContent}"`;
         
         const response = await ai.models.generateImages({
