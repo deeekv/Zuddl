@@ -4,10 +4,17 @@ import { createRoot } from 'react-dom/client';
 import { GoogleGenAI, Modality } from '@google/genai';
 
 const getGenAIClient = () => {
-  const apiKey = import.meta.env.VITE_GEMINI_API_KEY as string | undefined;
+  const rawApiKey = import.meta.env.VITE_GEMINI_API_KEY as string | undefined;
+  const apiKey = typeof rawApiKey === 'string' ? rawApiKey.trim() : undefined;
+
   if (!apiKey) {
-    throw new Error('Missing VITE_GEMINI_API_KEY environment variable. Please configure your Gemini API key.');
+    const deploymentHint = import.meta.env.DEV
+      ? 'Set VITE_GEMINI_API_KEY in your local .env.local file.'
+      : 'Double-check the Vercel Environment Variables dashboard, ensure VITE_GEMINI_API_KEY is set, and trigger a redeploy so the value is baked into the build.';
+
+    throw new Error(`Missing VITE_GEMINI_API_KEY environment variable. ${deploymentHint}`);
   }
+
   return new GoogleGenAI({ apiKey });
 };
 

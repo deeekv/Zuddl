@@ -21,5 +21,5 @@ View your app in AI Studio: https://ai.studio/apps/drive/1x2YAwapicOdwQmvWGxOffn
 
 ## Deploying to Vercel
 
-- Add `VITE_GEMINI_API_KEY` to your project's **Build & Runtime Environment Variables** in the Vercel dashboard so the key is available when Vite builds the production bundle.
+- Add `VITE_GEMINI_API_KEY` to your project's **Build & Runtime Environment Variables** in the Vercel dashboard so the key is available when Vite builds the production bundle. After updating the variable, trigger a fresh deployment so the new value is embedded in the statically generated client bundle.
 - Never commit your API key to the repository. Use the environment variable configuration instead.
