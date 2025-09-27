@@ -11,6 +11,32 @@ const getGenAIClient = () => {
   return new GoogleGenAI({ apiKey });
 };
 
+const generateImageWithHuggingFace = async (prompt: string): Promise<string> => {
+  const response = await fetch('/api/generate-huggingface', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt }),
+  });
+
+  let payload: { image?: string; error?: string } | undefined;
+  try {
+    payload = await response.json();
+  } catch {
+    // Ignore JSON parsing error; we'll handle below.
+  }
+
+  if (!response.ok) {
+    const message = payload?.error || 'Failed to generate image with Hugging Face.';
+    throw new Error(message);
+  }
+
+  if (!payload?.image) {
+    throw new Error('Hugging Face API did not return an image. Please try again.');
+  }
+
+  return `data:image/png;base64,${payload.image}`;
+};
+
 const ImagePreviewModal = ({ imageHistory, initialIndex, onClose, onDownload }) => {
   const [currentIndex, setCurrentIndex] = useState(initialIndex);
 
@@ -151,34 +177,44 @@ const App = () => {
     setCurrentVersions({});
 
     try {
-        const ai = getGenAIClient();
-        const basePrompt = `${STYLE_PROMPT} Based on the following blog content, generate images for a tech blog. Blog Content: "${blogContent}"`;
-        
-        const groupedByAspectRatio = imageConfigs.reduce((acc, config) => {
-            const ratio = findClosestSupportedRatio(config.width, config.height);
-            if (!acc[ratio]) acc[ratio] = [];
-            acc[ratio].push(config);
-            return acc;
-        }, {} as Record<string, ImageConfig[]>);
+        const basePrompt = `${STYLE_PROMPT} Based on the following blog content, generate images for a tech blog. Blog Content:"${blogContent}"`;
+        const generationModel = selectedModel === 'gemini-2.5-flash-image-preview'
+          ? 'imagen-4.0-generate-001'
+          : selectedModel;
 
-        const allGeneratedImages: { key: string, src: string }[] = [];
-
-        for (const ratio in groupedByAspectRatio) {
-            const configs = groupedByAspectRatio[ratio];
-            const prompt = `${basePrompt} Generate ${configs.length} different image(s).`;
-            const response = await ai.models.generateImages({
-                model: 'imagen-4.0-generate-001', prompt, config: { numberOfImages: configs.length, outputMimeType: 'image/png', aspectRatio: ratio },
-            });
-            response.generatedImages.forEach((img, index) => {
-                allGeneratedImages.push({
-                    key: configs[index].key,
-                    src: `data:image/png;base64,${img.image.imageBytes}`,
-                });
-            });
-        }
-        
         const newImages: Record<string, string[]> = {};
-        allGeneratedImages.forEach(({ key, src }) => newImages[key] = [src]);
+
+        if (generationModel === 'huggingface') {
+            for (const config of imageConfigs) {
+                const aspectRatio = findClosestSupportedRatio(config.width, config.height);
+                const prompt = `${basePrompt} Generate one image that fits an aspect ratio of ${aspectRatio}.`;
+                const imageSrc = await generateImageWithHuggingFace(prompt);
+                newImages[config.key] = [imageSrc];
+            }
+        } else {
+            const ai = getGenAIClient();
+            const groupedByAspectRatio = imageConfigs.reduce((acc, config) => {
+                const ratio = findClosestSupportedRatio(config.width, config.height);
+                if (!acc[ratio]) acc[ratio] = [];
+                acc[ratio].push(config);
+                return acc;
+            }, {} as Record<string, ImageConfig[]>);
+
+            for (const ratio in groupedByAspectRatio) {
+                const configs = groupedByAspectRatio[ratio];
+                const prompt = `${basePrompt} Generate ${configs.length} different image(s).`;
+                const response = await ai.models.generateImages({
+                    model: generationModel,
+                    prompt,
+                    config: { numberOfImages: configs.length, outputMimeType: 'image/png', aspectRatio: ratio },
+                });
+                response.generatedImages.forEach((img, index) => {
+                    const src = `data:image/png;base64,${img.image.imageBytes}`;
+                    newImages[configs[index].key] = [src];
+                });
+            }
+        }
+
         setImages(newImages);
 
         const initialVersions: Record<string, number> = {};
@@ -201,7 +237,7 @@ const App = () => {
     }
     setError(null);
     setRegenerating(imageKey);
-    
+
     const config = imageConfigs.find(c => c.key === imageKey);
     if (!config) {
         setError("Could not find configuration for the image.");
@@ -211,10 +247,10 @@ const App = () => {
     const aspectRatio = findClosestSupportedRatio(config.width, config.height);
 
     try {
-        const ai = getGenAIClient();
         let newImageSrc: string | null = null;
-        
+
         if (selectedModel === 'gemini-2.5-flash-image-preview') {
+            const ai = getGenAIClient();
             const currentImageHistory = images[imageKey];
             const currentImageIndex = currentVersions[imageKey];
             if (!currentImageHistory || currentImageIndex === undefined) {
@@ -222,16 +258,16 @@ const App = () => {
             }
             const currentImageSrc = currentImageHistory[currentImageIndex];
             const base64Data = currentImageSrc.split(',')[1];
-            
+
             const imagePart = { inlineData: { data: base64Data, mimeType: 'image/png' } };
             const textPart = { text: modificationPrompt };
-            
+
             const response = await ai.models.generateContent({
                 model: 'gemini-2.5-flash-image-preview',
                 contents: { parts: [imagePart, textPart] },
                 config: { responseModalities: [Modality.IMAGE, Modality.TEXT] },
             });
-            
+
             const imagePartResponse = response.candidates?.[0]?.content?.parts?.find(part => part.inlineData);
             if (imagePartResponse?.inlineData) {
                 newImageSrc = `data:image/png;base64,${imagePartResponse.inlineData.data}`;
@@ -239,18 +275,25 @@ const App = () => {
                 throw new Error("The editing model did not return an image. Please try a different prompt.");
             }
 
-        } else { // 'imagen-4.0-generate-001'
+        } else {
             const prompt = `${STYLE_PROMPT} Regenerate an image for a tech blog based on the original content and a modification request.
             Original Blog Content: "${blogContent}"
             Modification Request: "${modificationPrompt}"
             The required aspect ratio is ${aspectRatio}.`;
-            
-            const response = await ai.models.generateImages({
-                model: selectedModel, prompt, config: { numberOfImages: 1, outputMimeType: 'image/png', aspectRatio },
-            });
-            newImageSrc = `data:image/png;base64,${response.generatedImages[0].image.imageBytes}`;
+
+            if (selectedModel === 'huggingface') {
+                newImageSrc = await generateImageWithHuggingFace(prompt);
+            } else {
+                const ai = getGenAIClient();
+                const response = await ai.models.generateImages({
+                    model: selectedModel,
+                    prompt,
+                    config: { numberOfImages: 1, outputMimeType: 'image/png', aspectRatio },
+                });
+                newImageSrc = `data:image/png;base64,${response.generatedImages[0].image.imageBytes}`;
+            }
         }
-        
+
         if (newImageSrc) {
             setImages(prev => {
                 const history = prev[imageKey] || [];
@@ -286,25 +329,40 @@ const App = () => {
     const aspectRatio = findClosestSupportedRatio(config.width, config.height);
 
     try {
-        const ai = getGenAIClient();
+        const generationModel = selectedModel === 'gemini-2.5-flash-image-preview'
+          ? 'imagen-4.0-generate-001'
+          : selectedModel;
         const prompt = `${STYLE_PROMPT} Based on the following blog content, generate an image for a tech blog. Blog Content: "${blogContent}"`;
-        
-        const response = await ai.models.generateImages({
-            model: 'imagen-4.0-generate-001',
-            prompt,
-            config: { numberOfImages: 1, outputMimeType: 'image/png', aspectRatio },
-        });
 
-        if (response.generatedImages && response.generatedImages.length > 0) {
-            const newImageSrc = `data:image/png;base64,${response.generatedImages[0].image.imageBytes}`;
-            setImages(prev => ({
-                ...prev,
-                [imageKey]: [newImageSrc]
-            }));
-            setCurrentVersions(prev => ({...prev, [imageKey]: 0}));
+        let newImageSrc: string | null = null;
+
+        if (generationModel === 'huggingface') {
+            const huggingFacePrompt = `${prompt} The required aspect ratio is ${aspectRatio}.`;
+            newImageSrc = await generateImageWithHuggingFace(huggingFacePrompt);
         } else {
+            const ai = getGenAIClient();
+            const response = await ai.models.generateImages({
+                model: generationModel,
+                prompt,
+                config: { numberOfImages: 1, outputMimeType: 'image/png', aspectRatio },
+            });
+
+            if (response.generatedImages && response.generatedImages.length > 0) {
+                newImageSrc = `data:image/png;base64,${response.generatedImages[0].image.imageBytes}`;
+            } else {
+                throw new Error("Image generation failed to return an image.");
+            }
+        }
+
+        if (!newImageSrc) {
             throw new Error("Image generation failed to return an image.");
         }
+
+        setImages(prev => ({
+            ...prev,
+            [imageKey]: [newImageSrc]
+        }));
+        setCurrentVersions(prev => ({...prev, [imageKey]: 0}));
 
     } catch (err) {
         console.error(err);
@@ -313,7 +371,7 @@ const App = () => {
         setRegenerating(null);
     }
   };
-  
+
   const handlePromptChange = (e: React.ChangeEvent<HTMLInputElement>, key: string) => {
       setModificationPrompts(prev => ({ ...prev, [key]: e.target.value }));
   };
@@ -400,17 +458,18 @@ const App = () => {
       <h1>Zuddl Blog Thumbnail Generator</h1>
       <div className="main-controls">
         <div className="model-selector-wrapper">
-            <label htmlFor="model-selector">Regeneration Model</label>
+            <label htmlFor="model-selector">Image Provider</label>
             <div className="select-container">
-              <select 
-                  id="model-selector" 
+              <select
+                  id="model-selector"
                   className="model-selector"
-                  value={selectedModel} 
+                  value={selectedModel}
                   onChange={e => setSelectedModel(e.target.value)}
                   disabled={loading || !!regenerating}
               >
                   <option value="imagen-4.0-generate-001">Imagen 4.0 (Generate)</option>
                   <option value="gemini-2.5-flash-image-preview">Gemini 2.5 Flash (Edit)</option>
+                  <option value="huggingface">Hugging Face (Stable Diffusion)</option>
               </select>
             </div>
         </div>
