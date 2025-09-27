@@ -28,7 +28,7 @@ type VercelResponse = {
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 function getAuthToken(): string | undefined {
-  return process.env.HUGGING_FACE_API_TOKEN || process.env.HUGGING_FACE_TOKEN;
+  return process.env.HUGGING_FACE_TOKEN || process.env.HUGGING_FACE_API_TOKEN;
 }
 
 async function parseRequestBody(req: VercelRequest): Promise<IncomingBody> {
@@ -69,7 +69,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const token = getAuthToken();
     if (!token) {
-      res.status(500).json({ error: 'Missing Hugging Face API token. Set HUGGING_FACE_API_TOKEN or HUGGING_FACE_TOKEN.' });
+      res.status(500).json({ error: 'Missing Hugging Face API token. Set HUGGING_FACE_TOKEN (or legacy HUGGING_FACE_API_TOKEN).' });
       return;
     }
 
