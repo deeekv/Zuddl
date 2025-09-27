@@ -1,4 +1,4 @@
-const HF_MODEL = 'runwayml/stable-diffusion-v1-5';
+const HF_MODEL = 'stabilityai/sd-turbo';
 const HF_API_URL = `https://api-inference.huggingface.co/models/${HF_MODEL}`;
 
 export const generateHuggingFaceImage = async (prompt: string): Promise<string> => {
