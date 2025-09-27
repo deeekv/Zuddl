@@ -16,7 +16,8 @@ View your app in AI Studio: https://ai.studio/apps/drive/1x2YAwapicOdwQmvWGxOffn
 1. Install dependencies:
    `npm install`
 2. Set the `VITE_GEMINI_API_KEY` in [.env.local](.env.local) (or your shell) to your Gemini API key. The `VITE_` prefix is required so Vite exposes the value to the client bundle.
-3. Run the app:
+3. Set `HUGGING_FACE_TOKEN` for the Hugging Face proxy (the handler also accepts the legacy `HUGGING_FACE_API_TOKEN`).
+4. Run the app:
    `npm run dev`
 
 ## Deploying to Vercel

@@ -1,41 +1,67 @@
-
 import React, { useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { GoogleGenAI, Modality } from '@google/genai';
 
-const getGenAIClient = () => {
-  const apiKey = import.meta.env.VITE_GEMINI_API_KEY as string | undefined;
-  if (!apiKey) {
-    throw new Error('Missing VITE_GEMINI_API_KEY environment variable. Please configure your Gemini API key.');
-  }
-  return new GoogleGenAI({ apiKey });
-};
+type ProviderOption = 'google' | 'hugging-face';
 
-const ImagePreviewModal = ({ imageHistory, initialIndex, onClose, onDownload }) => {
+type GeneratedItem =
+  | { type: 'image'; contentType: string; src: string }
+  | { type: 'json'; contentType: string; data: unknown }
+  | { type: 'text'; contentType: string; data: string };
+
+interface ImagePreviewModalProps {
+  imageHistory: GeneratedItem[];
+  initialIndex: number;
+  onClose: () => void;
+  onDownload: (item: GeneratedItem, version: number) => void;
+}
+
+const ImagePreviewModal: React.FC<ImagePreviewModalProps> = ({ imageHistory, initialIndex, onClose, onDownload }) => {
   const [currentIndex, setCurrentIndex] = useState(initialIndex);
 
   const handlePrev = () => {
     setCurrentIndex(prev => Math.max(0, prev - 1));
   };
-  
+
   const handleNext = () => {
     setCurrentIndex(prev => Math.min(imageHistory.length - 1, prev + 1));
   };
 
-  const currentImageSrc = imageHistory[currentIndex];
+  const currentItem = imageHistory[currentIndex];
+
+  const renderPreview = (item: GeneratedItem | undefined) => {
+    if (!item) {
+      return null;
+    }
+
+    if (item.type === 'image') {
+      return <img src={item.src} alt={`Image version ${currentIndex + 1}`} />;
+    }
+
+    if (item.type === 'json') {
+      return <pre className="json-preview" aria-label="JSON preview">{JSON.stringify(item.data, null, 2)}</pre>;
+    }
+
+    return <pre className="text-preview" aria-label="Text preview">{item.data}</pre>;
+  };
 
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal-content" onClick={(e) => e.stopPropagation()}>
         <button className="modal-close-btn" onClick={onClose} aria-label="Close image preview">&times;</button>
         <div className="modal-image-wrapper">
-          <img src={currentImageSrc} alt={`Image version ${currentIndex + 1}`} />
+          {renderPreview(currentItem)}
         </div>
         <div className="modal-controls">
           <button className="btn btn-secondary" onClick={handlePrev} disabled={currentIndex === 0}>Previous</button>
           <span>Version {currentIndex + 1} of {imageHistory.length}</span>
           <button className="btn btn-secondary" onClick={handleNext} disabled={currentIndex === imageHistory.length - 1}>Next</button>
-          <button className="btn btn-primary" onClick={() => onDownload(currentImageSrc, currentIndex + 1)}>Download</button>
+          <button
+            className="btn btn-primary"
+            onClick={() => currentItem && onDownload(currentItem, currentIndex + 1)}
+            disabled={!currentItem}
+          >
+            Download
+          </button>
         </div>
       </div>
     </div>
@@ -51,11 +77,11 @@ interface ImageConfig {
   isRemovable: boolean;
 }
 
-const SUPPORTED_ASPECT_RATIOS = ["1:1", "4:3", "3:4", "16:9", "9:16"];
+const SUPPORTED_ASPECT_RATIOS = ['1:1', '4:3', '3:4', '16:9', '9:16'];
 
 const findClosestSupportedRatio = (width: number, height: number): string => {
   const targetRatio = width / height;
-  
+
   const ratioMap = SUPPORTED_ASPECT_RATIOS.map(r => {
     const [w, h] = r.split(':').map(Number);
     return { ratioString: r, decimal: w / h };
@@ -75,23 +101,144 @@ const findClosestSupportedRatio = (width: number, height: number): string => {
   return closest.ratioString;
 };
 
+const blobToDataURL = (blob: Blob): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const result = reader.result;
+      if (typeof result === 'string') {
+        resolve(result);
+      } else {
+        reject(new Error('Failed to convert blob to data URL.'));
+      }
+    };
+    reader.onerror = () => reject(new Error('Failed to read response blob.'));
+    reader.readAsDataURL(blob);
+  });
+};
+
 const parseErrorMessage = (err: unknown): string => {
-  if (err instanceof Error) {
-    const message = err.message;
-    // Attempt to extract the user-facing message part from a JSON string.
-    const match = message.match(/"message":\s*"(.*?)"/);
-    if (match && match[1]) {
-      return match[1]; // Return the extracted message.
-    }
-    return message; // Fallback to the full message if regex fails.
+  if (!err) {
+    return 'An unknown error occurred while generating images.';
   }
+
+  if (typeof err === 'string') {
+    return err;
+  }
+
+  if (typeof err === 'object' && 'error' in (err as Record<string, unknown>)) {
+    const message = (err as Record<string, unknown>).error;
+    if (typeof message === 'string') {
+      return message;
+    }
+  }
+
+  if (err instanceof Error) {
+    try {
+      const parsed = JSON.parse(err.message);
+      if (typeof parsed?.error === 'string') {
+        return parsed.error;
+      }
+    } catch (_) {
+      // ignore JSON parse failures
+    }
+    return err.message;
+  }
+
   return 'An unknown error occurred while generating images.';
 };
 
+interface HuggingFaceRequestPayload {
+  inputs: string;
+  model?: string;
+  parameters?: Record<string, unknown>;
+}
+
+const callHuggingFace = async (payload: HuggingFaceRequestPayload): Promise<GeneratedItem> => {
+  const requestBody: Record<string, unknown> = { inputs: payload.inputs };
+  if (payload.model) {
+    requestBody.model = payload.model;
+  }
+  if (payload.parameters && Object.keys(payload.parameters).length > 0) {
+    requestBody.parameters = payload.parameters;
+  }
+
+  const response = await fetch('/api/hugging-face', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(requestBody),
+  });
+
+  const contentType = response.headers.get('content-type') || '';
+
+  if (!response.ok) {
+    let message = `Hugging Face request failed with status ${response.status}.`;
+    try {
+      const data = await response.json();
+      if (typeof data?.error === 'string') {
+        message = data.error;
+      }
+    } catch (_) {
+      // ignore JSON parse errors and fall back to generic message
+    }
+    throw new Error(message);
+  }
+
+  if (contentType.startsWith('image/')) {
+    const blob = await response.blob();
+    const dataUrl = await blobToDataURL(blob);
+    return { type: 'image', contentType, src: dataUrl };
+  }
+
+  if (contentType.includes('application/json')) {
+    const data = await response.json();
+    return { type: 'json', contentType, data };
+  }
+
+  const text = await response.text();
+  return { type: 'text', contentType: contentType || 'text/plain', data: text };
+};
+
+const downloadGeneratedItem = (key: string, item: GeneratedItem, version: number) => {
+  const baseName = `${key}-v${version}`;
+  const link = document.createElement('a');
+
+  if (item.type === 'image') {
+    link.href = item.src;
+    const extension = item.contentType.split('/')[1] || 'png';
+    link.download = `${baseName}.${extension}`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    return;
+  }
+
+  let blob: Blob;
+  let extension = 'txt';
+
+  if (item.type === 'json') {
+    blob = new Blob([JSON.stringify(item.data, null, 2)], { type: 'application/json' });
+    extension = 'json';
+  } else {
+    blob = new Blob([item.data], { type: item.contentType || 'text/plain' });
+  }
+
+  const url = URL.createObjectURL(blob);
+  link.href = url;
+  link.download = `${baseName}.${extension}`;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+};
 
 const App = () => {
+  const [selectedProvider, setSelectedProvider] = useState<ProviderOption>('hugging-face');
+  const [huggingFaceModel, setHuggingFaceModel] = useState('');
   const [blogContent, setBlogContent] = useState('');
-  const [images, setImages] = useState<Record<string, string[]>>({});
+  const [generatedItems, setGeneratedItems] = useState<Record<string, GeneratedItem[]>>({});
   const [currentVersions, setCurrentVersions] = useState<Record<string, number>>({});
   const [modificationPrompts, setModificationPrompts] = useState<Record<string, string>>({
     thumbnail16x9: '',
@@ -102,9 +249,8 @@ const App = () => {
   const [loading, setLoading] = useState(false);
   const [regenerating, setRegenerating] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [selectedModel, setSelectedModel] = useState('imagen-4.0-generate-001');
-  const [modalState, setModalState] = useState<{ key: string; history: string[]; index: number } | null>(null);
-  
+  const [modalState, setModalState] = useState<{ key: string; history: GeneratedItem[]; index: number } | null>(null);
+
   const initialImageConfigs: ImageConfig[] = [
     { key: 'thumbnail16x9', title: 'Thumbnail', width: 1280, height: 720, aspectClass: 'aspect-16-9', isRemovable: false },
     { key: 'thumbnail4x3', title: 'Thumbnail', width: 812, height: 608, aspectClass: 'aspect-4-3', isRemovable: false },
@@ -140,51 +286,53 @@ const App = () => {
   - **Overall Feel:** Product-centric, data-driven, clean, and user-friendly.
   `;
 
+  const ensureHuggingFaceSelected = (action: string) => {
+    if (selectedProvider !== 'hugging-face') {
+      setError(`Switch the provider to Hugging Face to ${action}.`);
+      return false;
+    }
+    return true;
+  };
+
   const generateInitialImages = async () => {
     if (!blogContent.trim()) {
       setError('Please paste your blog content first.');
       return;
     }
+
+    if (!ensureHuggingFaceSelected('generate images')) {
+      return;
+    }
+
     setError(null);
     setLoading(true);
-    setImages({});
+    setGeneratedItems({});
     setCurrentVersions({});
 
     try {
-        const ai = getGenAIClient();
-        const basePrompt = `${STYLE_PROMPT} Based on the following blog content, generate images for a tech blog. Blog Content: "${blogContent}"`;
-        
-        const groupedByAspectRatio = imageConfigs.reduce((acc, config) => {
-            const ratio = findClosestSupportedRatio(config.width, config.height);
-            if (!acc[ratio]) acc[ratio] = [];
-            acc[ratio].push(config);
-            return acc;
-        }, {} as Record<string, ImageConfig[]>);
+      const basePrompt = `${STYLE_PROMPT} Based on the following blog content, generate images for a tech blog. Blog Content: "${blogContent}"`;
+      const modelOverride = huggingFaceModel.trim() || undefined;
 
-        const allGeneratedImages: { key: string, src: string }[] = [];
+      const results = await Promise.all(imageConfigs.map(async (config) => {
+        const aspectRatio = findClosestSupportedRatio(config.width, config.height);
+        const prompt = `${basePrompt} Create an image for the ${config.title} slot with dimensions ${config.width}x${config.height} pixels and an aspect ratio of ${aspectRatio}.`;
+        const item = await callHuggingFace({
+          inputs: prompt,
+          model: modelOverride,
+          parameters: { aspect_ratio: aspectRatio },
+        });
+        return { key: config.key, item };
+      }));
 
-        for (const ratio in groupedByAspectRatio) {
-            const configs = groupedByAspectRatio[ratio];
-            const prompt = `${basePrompt} Generate ${configs.length} different image(s).`;
-            const response = await ai.models.generateImages({
-                model: 'imagen-4.0-generate-001', prompt, config: { numberOfImages: configs.length, outputMimeType: 'image/png', aspectRatio: ratio },
-            });
-            response.generatedImages.forEach((img, index) => {
-                allGeneratedImages.push({
-                    key: configs[index].key,
-                    src: `data:image/png;base64,${img.image.imageBytes}`,
-                });
-            });
-        }
-        
-        const newImages: Record<string, string[]> = {};
-        allGeneratedImages.forEach(({ key, src }) => newImages[key] = [src]);
-        setImages(newImages);
+      const newGeneratedItems: Record<string, GeneratedItem[]> = {};
+      const versionMap: Record<string, number> = {};
+      results.forEach(({ key, item }) => {
+        newGeneratedItems[key] = [item];
+        versionMap[key] = 0;
+      });
 
-        const initialVersions: Record<string, number> = {};
-        Object.keys(newImages).forEach(key => initialVersions[key] = 0);
-        setCurrentVersions(initialVersions);
-
+      setGeneratedItems(newGeneratedItems);
+      setCurrentVersions(versionMap);
     } catch (err) {
       console.error(err);
       setError(parseErrorMessage(err));
@@ -196,76 +344,47 @@ const App = () => {
   const regenerateImage = async (imageKey: string) => {
     const modificationPrompt = modificationPrompts[imageKey];
     if (!modificationPrompt.trim()) {
-        setError(`Please provide a modification instruction for this image.`);
-        return;
+      setError('Please provide a modification instruction for this image.');
+      return;
     }
+
+    if (!ensureHuggingFaceSelected('regenerate images')) {
+      return;
+    }
+
     setError(null);
     setRegenerating(imageKey);
-    
+
     const config = imageConfigs.find(c => c.key === imageKey);
     if (!config) {
-        setError("Could not find configuration for the image.");
-        setRegenerating(null);
-        return;
+      setError('Could not find configuration for the image.');
+      setRegenerating(null);
+      return;
     }
     const aspectRatio = findClosestSupportedRatio(config.width, config.height);
 
     try {
-        const ai = getGenAIClient();
-        let newImageSrc: string | null = null;
-        
-        if (selectedModel === 'gemini-2.5-flash-image-preview') {
-            const currentImageHistory = images[imageKey];
-            const currentImageIndex = currentVersions[imageKey];
-            if (!currentImageHistory || currentImageIndex === undefined) {
-                throw new Error("Cannot edit an image that doesn't exist.");
-            }
-            const currentImageSrc = currentImageHistory[currentImageIndex];
-            const base64Data = currentImageSrc.split(',')[1];
-            
-            const imagePart = { inlineData: { data: base64Data, mimeType: 'image/png' } };
-            const textPart = { text: modificationPrompt };
-            
-            const response = await ai.models.generateContent({
-                model: 'gemini-2.5-flash-image-preview',
-                contents: { parts: [imagePart, textPart] },
-                config: { responseModalities: [Modality.IMAGE, Modality.TEXT] },
-            });
-            
-            const imagePartResponse = response.candidates?.[0]?.content?.parts?.find(part => part.inlineData);
-            if (imagePartResponse?.inlineData) {
-                newImageSrc = `data:image/png;base64,${imagePartResponse.inlineData.data}`;
-            } else {
-                throw new Error("The editing model did not return an image. Please try a different prompt.");
-            }
+      const modelOverride = huggingFaceModel.trim() || undefined;
+      const prompt = `${STYLE_PROMPT} Regenerate an image for a tech blog based on the original content and a modification request.\nOriginal Blog Content: "${blogContent}"\nModification Request: "${modificationPrompt}"\nThe required aspect ratio is ${aspectRatio}.`;
 
-        } else { // 'imagen-4.0-generate-001'
-            const prompt = `${STYLE_PROMPT} Regenerate an image for a tech blog based on the original content and a modification request.
-            Original Blog Content: "${blogContent}"
-            Modification Request: "${modificationPrompt}"
-            The required aspect ratio is ${aspectRatio}.`;
-            
-            const response = await ai.models.generateImages({
-                model: selectedModel, prompt, config: { numberOfImages: 1, outputMimeType: 'image/png', aspectRatio },
-            });
-            newImageSrc = `data:image/png;base64,${response.generatedImages[0].image.imageBytes}`;
-        }
-        
-        if (newImageSrc) {
-            setImages(prev => {
-                const history = prev[imageKey] || [];
-                // Truncate history if we have undone changes
-                const newHistory = history.slice(0, (currentVersions[imageKey] ?? 0) + 1);
-                return { ...prev, [imageKey]: [...newHistory, newImageSrc as string] };
-            });
-            setCurrentVersions(prev => ({...prev, [imageKey]: (prev[imageKey] ?? -1) + 1}));
-        }
+      const item = await callHuggingFace({
+        inputs: prompt,
+        model: modelOverride,
+        parameters: { aspect_ratio: aspectRatio },
+      });
 
+      setGeneratedItems(prev => {
+        const history = prev[imageKey] || [];
+        const currentIndex = currentVersions[imageKey] ?? history.length - 1;
+        const trimmedHistory = currentIndex >= 0 ? history.slice(0, currentIndex + 1) : history;
+        return { ...prev, [imageKey]: [...trimmedHistory, item] };
+      });
+      setCurrentVersions(prev => ({ ...prev, [imageKey]: (prev[imageKey] ?? -1) + 1 }));
     } catch (err) {
-        console.error(err);
-        setError(parseErrorMessage(err));
+      console.error(err);
+      setError(parseErrorMessage(err));
     } finally {
-        setRegenerating(null);
+      setRegenerating(null);
     }
   };
 
@@ -274,48 +393,44 @@ const App = () => {
       setError('Please paste your blog content first.');
       return;
     }
+
+    if (!ensureHuggingFaceSelected('generate images')) {
+      return;
+    }
+
     setError(null);
     setRegenerating(imageKey);
 
     const config = imageConfigs.find(c => c.key === imageKey);
     if (!config) {
-        setError("Could not find configuration for the image.");
-        setRegenerating(null);
-        return;
+      setError('Could not find configuration for the image.');
+      setRegenerating(null);
+      return;
     }
     const aspectRatio = findClosestSupportedRatio(config.width, config.height);
 
     try {
-        const ai = getGenAIClient();
-        const prompt = `${STYLE_PROMPT} Based on the following blog content, generate an image for a tech blog. Blog Content: "${blogContent}"`;
-        
-        const response = await ai.models.generateImages({
-            model: 'imagen-4.0-generate-001',
-            prompt,
-            config: { numberOfImages: 1, outputMimeType: 'image/png', aspectRatio },
-        });
+      const modelOverride = huggingFaceModel.trim() || undefined;
+      const prompt = `${STYLE_PROMPT} Based on the following blog content, generate an image for a tech blog. Blog Content: "${blogContent}"`;
 
-        if (response.generatedImages && response.generatedImages.length > 0) {
-            const newImageSrc = `data:image/png;base64,${response.generatedImages[0].image.imageBytes}`;
-            setImages(prev => ({
-                ...prev,
-                [imageKey]: [newImageSrc]
-            }));
-            setCurrentVersions(prev => ({...prev, [imageKey]: 0}));
-        } else {
-            throw new Error("Image generation failed to return an image.");
-        }
+      const item = await callHuggingFace({
+        inputs: `${prompt} The required aspect ratio is ${aspectRatio}.`,
+        model: modelOverride,
+        parameters: { aspect_ratio: aspectRatio },
+      });
 
+      setGeneratedItems(prev => ({ ...prev, [imageKey]: [item] }));
+      setCurrentVersions(prev => ({ ...prev, [imageKey]: 0 }));
     } catch (err) {
-        console.error(err);
-        setError(parseErrorMessage(err));
+      console.error(err);
+      setError(parseErrorMessage(err));
     } finally {
-        setRegenerating(null);
+      setRegenerating(null);
     }
   };
-  
+
   const handlePromptChange = (e: React.ChangeEvent<HTMLInputElement>, key: string) => {
-      setModificationPrompts(prev => ({ ...prev, [key]: e.target.value }));
+    setModificationPrompts(prev => ({ ...prev, [key]: e.target.value }));
   };
 
   const handleDimensionChange = (key: string, dim: 'width' | 'height', value: string) => {
@@ -323,7 +438,7 @@ const App = () => {
     if (isNaN(numValue) || numValue <= 0) return;
     setImageConfigs(prev => prev.map(c => c.key === key ? { ...c, [dim]: numValue } : c));
   };
-  
+
   const addInnerImage = () => {
     const newKey = `innerImage${Date.now()}`;
     const newImage: ImageConfig = {
@@ -335,61 +450,60 @@ const App = () => {
       isRemovable: true,
     };
     setImageConfigs(prev => [...prev, newImage]);
-    setModificationPrompts(prev => ({...prev, [newKey]: ''}));
+    setModificationPrompts(prev => ({ ...prev, [newKey]: '' }));
   };
 
   const removeInnerImage = (keyToRemove: string) => {
     setImageConfigs(prev => prev.filter(c => c.key !== keyToRemove));
-    // Clean up state
-    setImages(prev => {
-      const newState = {...prev};
+    setGeneratedItems(prev => {
+      const newState = { ...prev };
       delete newState[keyToRemove];
       return newState;
     });
     setCurrentVersions(prev => {
-      const newState = {...prev};
+      const newState = { ...prev };
       delete newState[keyToRemove];
       return newState;
     });
     setModificationPrompts(prev => {
-      const newState = {...prev};
+      const newState = { ...prev };
       delete newState[keyToRemove];
       return newState;
     });
   };
 
   const handleUndo = (key: string) => {
-    setCurrentVersions(prev => ({...prev, [key]: Math.max(0, prev[key] - 1)}));
+    setCurrentVersions(prev => {
+      const current = prev[key] ?? 0;
+      return { ...prev, [key]: Math.max(0, current - 1) };
+    });
   };
 
   const handleDownload = (key: string) => {
-    const history = images[key];
+    const history = generatedItems[key];
     const currentIndex = currentVersions[key];
-    if (!history || currentIndex === undefined) return;
+    if (!history || currentIndex === undefined || currentIndex < 0) return;
 
-    const imageSrc = history[currentIndex];
+    const item = history[currentIndex];
+    if (!item) return;
+
     const version = currentIndex + 1;
-    const link = document.createElement('a');
-    link.href = imageSrc;
-    link.download = `${key}-v${version}.png`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+    downloadGeneratedItem(key, item, version);
   };
 
-  const handleModalDownload = (src: string, version: number) => {
+  const handleModalDownload = (item: GeneratedItem, version: number) => {
     const key = modalState?.key || 'downloaded-image';
-    const link = document.createElement('a');
-    link.href = src;
-    link.download = `${key}-v${version}.png`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+    downloadGeneratedItem(key, item, version);
+  };
+
+  const handleProviderChange = (value: ProviderOption) => {
+    setSelectedProvider(value);
+    setError(null);
   };
 
   return (
     <div className="container">
-       {modalState && (
+      {modalState && (
         <ImagePreviewModal
           imageHistory={modalState.history}
           initialIndex={modalState.index}
@@ -400,19 +514,47 @@ const App = () => {
       <h1>Zuddl Blog Thumbnail Generator</h1>
       <div className="main-controls">
         <div className="model-selector-wrapper">
-            <label htmlFor="model-selector">Regeneration Model</label>
+          <label>Image Provider</label>
+          <div className="provider-toggle" role="radiogroup" aria-label="Image provider">
+            <label className="provider-option">
+              <input
+                type="radio"
+                name="image-provider"
+                value="hugging-face"
+                checked={selectedProvider === 'hugging-face'}
+                onChange={() => handleProviderChange('hugging-face')}
+                disabled={loading || !!regenerating}
+              />
+              Hugging Face
+            </label>
+            <label className="provider-option">
+              <input
+                type="radio"
+                name="image-provider"
+                value="google"
+                checked={selectedProvider === 'google'}
+                onChange={() => handleProviderChange('google')}
+                disabled={loading || !!regenerating}
+              />
+              Google
+            </label>
+          </div>
+          {selectedProvider === 'hugging-face' ? (
             <div className="select-container">
-              <select 
-                  id="model-selector" 
-                  className="model-selector"
-                  value={selectedModel} 
-                  onChange={e => setSelectedModel(e.target.value)}
-                  disabled={loading || !!regenerating}
-              >
-                  <option value="imagen-4.0-generate-001">Imagen 4.0 (Generate)</option>
-                  <option value="gemini-2.5-flash-image-preview">Gemini 2.5 Flash (Edit)</option>
-              </select>
+              <input
+                id="hf-model"
+                className="hf-model-input"
+                type="text"
+                value={huggingFaceModel}
+                onChange={(e) => setHuggingFaceModel(e.target.value)}
+                placeholder="Optional model override (defaults to stabilityai/sd-turbo)"
+                disabled={loading || !!regenerating}
+                aria-label="Hugging Face model override"
+              />
             </div>
+          ) : (
+            <p className="provider-help-text">Google image generation is disabled in this environment.</p>
+          )}
         </div>
         <textarea
           className="blog-input"
@@ -428,9 +570,10 @@ const App = () => {
       {error && <p className="error-message" role="alert">{error}</p>}
       <div className="image-grid">
         {imageConfigs.map(({ key, title, width, height, aspectClass, isRemovable }) => {
-          const history = images[key] || [];
-          const currentIndex = currentVersions[key] ?? -1;
-          const currentImageSrc = history[currentIndex];
+          const history = generatedItems[key] || [];
+          const currentIndex = currentVersions[key] ?? (history.length > 0 ? history.length - 1 : -1);
+          const hasEntry = history.length > 0 && currentIndex >= 0;
+          const currentItem = hasEntry ? history[currentIndex] : undefined;
           const canUndo = currentIndex > 0;
 
           return (
@@ -445,39 +588,53 @@ const App = () => {
                   </div>
                 </div>
                 {isRemovable && <button className="btn-remove" onClick={() => removeInnerImage(key)} aria-label="Remove image">&times;</button>}
-                {history.length > 0 && <span className="version-info">Version {currentIndex + 1} / {history.length}</span>}
+                {hasEntry && <span className="version-info">Version {currentIndex + 1} / {history.length}</span>}
               </div>
-              <div className={`image-container ${aspectClass}`} style={{aspectRatio: `${width} / ${height}`}}>
+              <div className={`image-container ${aspectClass}`} style={{ aspectRatio: `${width} / ${height}` }}>
                 {(loading || regenerating === key) && (
                   <div className="loading-overlay"><div className="spinner"></div></div>
                 )}
-                {currentImageSrc ? <img src={currentImageSrc} alt={title} /> : (!loading && <span className="placeholder-text">Image will appear here</span>)}
+                {currentItem ? (
+                  currentItem.type === 'image' ? (
+                    <img src={currentItem.src} alt={title} />
+                  ) : currentItem.type === 'json' ? (
+                    <pre className="json-preview">{JSON.stringify(currentItem.data, null, 2)}</pre>
+                  ) : (
+                    <pre className="text-preview">{currentItem.data}</pre>
+                  )
+                ) : (!loading && <span className="placeholder-text">Image will appear here</span>)}
               </div>
               <div className="image-actions">
-                <button className="btn btn-secondary" onClick={() => setModalState({ key, history, index: currentIndex })} disabled={!currentImageSrc}>View</button>
-                <button className="btn btn-secondary" onClick={() => handleDownload(key)} disabled={!currentImageSrc}>Download</button>
+                <button
+                  className="btn btn-secondary"
+                  onClick={() => hasEntry && setModalState({ key, history, index: currentIndex })}
+                  disabled={!hasEntry}
+                >
+                  View
+                </button>
+                <button className="btn btn-secondary" onClick={() => handleDownload(key)} disabled={!hasEntry}>Download</button>
                 <button className="btn btn-secondary" onClick={() => handleUndo(key)} disabled={!canUndo}>Undo</button>
               </div>
               <div className="regenerate-controls">
                 <input
                   type="text"
                   className="regenerate-input"
-                  placeholder={currentImageSrc ? "Type changes here..." : "Generates from blog content"}
+                  placeholder={hasEntry ? 'Type changes here...' : 'Generates from blog content'}
                   value={modificationPrompts[key] || ''}
                   onChange={(e) => handlePromptChange(e, key)}
                   aria-label={`Modification prompt for ${title}`}
-                  disabled={loading || !!regenerating || !currentImageSrc}
+                  disabled={loading || !!regenerating || !hasEntry}
                 />
                 <button
                   className="btn btn-secondary"
-                  onClick={() => currentImageSrc ? regenerateImage(key) : generateSingleImage(key)}
+                  onClick={() => hasEntry ? regenerateImage(key) : generateSingleImage(key)}
                   disabled={loading || !!regenerating}
                 >
-                  {currentImageSrc ? 'Regenerate' : 'Generate'}
+                  {hasEntry ? 'Regenerate' : 'Generate'}
                 </button>
               </div>
             </div>
-          )
+          );
         })}
       </div>
       <button className="btn btn-primary add-image-btn" onClick={addInnerImage} disabled={loading || !!regenerating}>
