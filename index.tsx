@@ -1,7 +1,33 @@
 
 import React, { useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { GoogleGenAI, Modality } from '@google/genai';
+import { GoogleGenAI } from '@google/genai';
+
+type GenerationModel =
+  | 'gemini-1.5-flash'
+  | 'gemini-1.5-flash-latest'
+  | 'gemini-1.5-pro'
+  | 'gemini-1.5-pro-latest'
+  | 'imagen-4.0-generate-001';
+
+interface ModelOption {
+  value: GenerationModel;
+  label: string;
+  paid?: boolean;
+}
+
+const CORE_MODEL_OPTIONS: ModelOption[] = [
+  { value: 'gemini-1.5-flash', label: 'Gemini 1.5 Flash' },
+  { value: 'gemini-1.5-flash-latest', label: 'Gemini 1.5 Flash (Latest)' },
+  { value: 'gemini-1.5-pro', label: 'Gemini 1.5 Pro' },
+  { value: 'gemini-1.5-pro-latest', label: 'Gemini 1.5 Pro (Latest)' },
+];
+
+const OPTIONAL_MODEL_OPTIONS: ModelOption[] = [
+  { value: 'imagen-4.0-generate-001', label: 'Imagen 4.0', paid: true },
+];
+
+const ALL_MODEL_OPTIONS: ModelOption[] = [...CORE_MODEL_OPTIONS, ...OPTIONAL_MODEL_OPTIONS];
 
 const getGenAIClient = () => {
   const apiKey = import.meta.env.VITE_GEMINI_API_KEY as string | undefined;
@@ -102,7 +128,7 @@ const App = () => {
   const [loading, setLoading] = useState(false);
   const [regenerating, setRegenerating] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [selectedModel, setSelectedModel] = useState('imagen-4.0-generate-001');
+  const [selectedModel, setSelectedModel] = useState<GenerationModel>(ALL_MODEL_OPTIONS[0].value);
   const [modalState, setModalState] = useState<{ key: string; history: string[]; index: number } | null>(null);
   
   const initialImageConfigs: ImageConfig[] = [
@@ -167,7 +193,9 @@ const App = () => {
             const configs = groupedByAspectRatio[ratio];
             const prompt = `${basePrompt} Generate ${configs.length} different image(s).`;
             const response = await ai.models.generateImages({
-                model: 'imagen-4.0-generate-001', prompt, config: { numberOfImages: configs.length, outputMimeType: 'image/png', aspectRatio: ratio },
+                model: selectedModel,
+                prompt,
+                config: { numberOfImages: configs.length, outputMimeType: 'image/png', aspectRatio: ratio },
             });
             response.generatedImages.forEach((img, index) => {
                 allGeneratedImages.push({
@@ -214,43 +242,18 @@ const App = () => {
         const ai = getGenAIClient();
         let newImageSrc: string | null = null;
         
-        if (selectedModel === 'gemini-2.5-flash-image-preview') {
-            const currentImageHistory = images[imageKey];
-            const currentImageIndex = currentVersions[imageKey];
-            if (!currentImageHistory || currentImageIndex === undefined) {
-                throw new Error("Cannot edit an image that doesn't exist.");
-            }
-            const currentImageSrc = currentImageHistory[currentImageIndex];
-            const base64Data = currentImageSrc.split(',')[1];
-            
-            const imagePart = { inlineData: { data: base64Data, mimeType: 'image/png' } };
-            const textPart = { text: modificationPrompt };
-            
-            const response = await ai.models.generateContent({
-                model: 'gemini-2.5-flash-image-preview',
-                contents: { parts: [imagePart, textPart] },
-                config: { responseModalities: [Modality.IMAGE, Modality.TEXT] },
-            });
-            
-            const imagePartResponse = response.candidates?.[0]?.content?.parts?.find(part => part.inlineData);
-            if (imagePartResponse?.inlineData) {
-                newImageSrc = `data:image/png;base64,${imagePartResponse.inlineData.data}`;
-            } else {
-                throw new Error("The editing model did not return an image. Please try a different prompt.");
-            }
+        const prompt = `${STYLE_PROMPT} Regenerate an image for a tech blog based on the original content and a modification request.
+        Original Blog Content: "${blogContent}"
+        Modification Request: "${modificationPrompt}"
+        The required aspect ratio is ${aspectRatio}.`;
 
-        } else { // 'imagen-4.0-generate-001'
-            const prompt = `${STYLE_PROMPT} Regenerate an image for a tech blog based on the original content and a modification request.
-            Original Blog Content: "${blogContent}"
-            Modification Request: "${modificationPrompt}"
-            The required aspect ratio is ${aspectRatio}.`;
-            
-            const response = await ai.models.generateImages({
-                model: selectedModel, prompt, config: { numberOfImages: 1, outputMimeType: 'image/png', aspectRatio },
-            });
-            newImageSrc = `data:image/png;base64,${response.generatedImages[0].image.imageBytes}`;
-        }
-        
+        const response = await ai.models.generateImages({
+            model: selectedModel,
+            prompt,
+            config: { numberOfImages: 1, outputMimeType: 'image/png', aspectRatio },
+        });
+        newImageSrc = `data:image/png;base64,${response.generatedImages[0].image.imageBytes}`;
+
         if (newImageSrc) {
             setImages(prev => {
                 const history = prev[imageKey] || [];
@@ -290,7 +293,7 @@ const App = () => {
         const prompt = `${STYLE_PROMPT} Based on the following blog content, generate an image for a tech blog. Blog Content: "${blogContent}"`;
         
         const response = await ai.models.generateImages({
-            model: 'imagen-4.0-generate-001',
+            model: selectedModel,
             prompt,
             config: { numberOfImages: 1, outputMimeType: 'image/png', aspectRatio },
         });
@@ -402,15 +405,27 @@ const App = () => {
         <div className="model-selector-wrapper">
             <label htmlFor="model-selector">Regeneration Model</label>
             <div className="select-container">
-              <select 
-                  id="model-selector" 
+              <select
+                  id="model-selector"
                   className="model-selector"
-                  value={selectedModel} 
-                  onChange={e => setSelectedModel(e.target.value)}
+                  value={selectedModel}
+                  onChange={e => setSelectedModel(e.target.value as GenerationModel)}
                   disabled={loading || !!regenerating}
               >
-                  <option value="imagen-4.0-generate-001">Imagen 4.0 (Generate)</option>
-                  <option value="gemini-2.5-flash-image-preview">Gemini 2.5 Flash (Edit)</option>
+                  {CORE_MODEL_OPTIONS.map(option => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                  {OPTIONAL_MODEL_OPTIONS.length > 0 && (
+                    <optgroup label="Optional (Paid)">
+                      {OPTIONAL_MODEL_OPTIONS.map(option => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}{option.paid ? ' (Paid)' : ''}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
               </select>
             </div>
         </div>
