@@ -95,8 +95,39 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       ...rest,
     };
 
-    const modelId = model || DEFAULT_MODEL;
-    const url = `${HF_API_URL}/${encodeURIComponent(modelId)}`;
+    const rawModelId = (model || DEFAULT_MODEL).trim();
+    if (!rawModelId) {
+      res.status(400).json({ error: 'Model ID must be a non-empty string.' });
+      return;
+    }
+
+    if (/\s/.test(rawModelId)) {
+      res.status(400).json({ error: 'Model ID must not contain spaces.' });
+      return;
+    }
+
+    if (/\/\//.test(rawModelId)) {
+      res.status(400).json({ error: 'Model ID must not contain consecutive slashes.' });
+      return;
+    }
+
+    const segments = rawModelId.split('/');
+    if (segments.length !== 2) {
+      res.status(400).json({ error: 'Model ID must follow the "org/model" format.' });
+      return;
+    }
+
+    const [org, name] = segments;
+    if (!org || !name) {
+      res.status(400).json({ error: 'Model ID must follow the "org/model" format.' });
+      return;
+    }
+
+    const url = `${HF_API_URL}/${encodeURIComponent(org)}/${encodeURIComponent(name)}`;
+    const debugEnabled = (process.env.DEBUG || '').split(',').map(flag => flag.trim()).includes('hugging-face');
+    if (debugEnabled) {
+      console.debug('[hugging-face] forwarding request to', url);
+    }
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       const response = await fetch(url, {
