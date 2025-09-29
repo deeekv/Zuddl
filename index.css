@@ -72,6 +72,42 @@ h1 {
   gap: var(--spacing-m);
 }
 
+.batch-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spacing-s);
+  align-items: center;
+}
+
+.batch-controls .btn-secondary {
+  height: 44px;
+}
+
+.skip-inner-link {
+  background: none;
+  border: none;
+  color: var(--primary-color);
+  cursor: pointer;
+  font-weight: 600;
+  text-decoration: underline;
+  padding: 0;
+  height: 44px;
+  display: inline-flex;
+  align-items: center;
+}
+
+.skip-inner-link:disabled {
+  color: var(--border-color);
+  cursor: not-allowed;
+  text-decoration: none;
+}
+
+.info-message {
+  margin: var(--spacing-s) 0 0;
+  color: var(--primary-color);
+  font-weight: 600;
+}
+
 .main-controls .btn-primary {
   align-self: flex-start;
 }
@@ -301,6 +337,42 @@ h1 {
 .placeholder-text {
   color: var(--placeholder-text-color);
   font-size: 0.9rem;
+}
+
+.slot-status {
+  margin-top: var(--spacing-s);
+  font-size: 0.9rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: baseline;
+}
+
+.slot-status-label {
+  font-weight: 600;
+  text-transform: capitalize;
+}
+
+.slot-status.slot-status-generating .slot-status-label,
+.slot-status.slot-status-retrying .slot-status-label,
+.slot-status.slot-status-queued .slot-status-label {
+  color: var(--primary-color);
+}
+
+.slot-status.slot-status-done .slot-status-label {
+  color: #198754;
+}
+
+.slot-status.slot-status-error .slot-status-label {
+  color: var(--error-color);
+}
+
+.slot-status-message {
+  color: var(--text-color);
+}
+
+.slot-status-error {
+  color: var(--error-color);
 }
 
 .image-actions {

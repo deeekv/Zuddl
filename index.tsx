@@ -1,7 +1,30 @@
 
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { GoogleGenAI, Modality } from '@google/genai';
+
+const parsePositiveNumber = (value: string | number | undefined, fallback: number) => {
+  const numeric = typeof value === 'number' ? value : Number(value ?? fallback);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : fallback;
+};
+
+const HUGGING_FACE_MAX_CONCURRENCY = Math.max(1, Math.floor(parsePositiveNumber(import.meta.env.VITE_HF_MAX_CONCURRENCY, 1)));
+const HUGGING_FACE_DEFAULT_STEPS = Math.floor(parsePositiveNumber(import.meta.env.VITE_HF_STEPS, 5));
+const HUGGING_FACE_DEFAULT_GUIDANCE = parsePositiveNumber(import.meta.env.VITE_HF_GUIDANCE, 1.5);
+const CLAMPED_HF_STEPS = Math.min(6, Math.max(4, HUGGING_FACE_DEFAULT_STEPS));
+const CLAMPED_HF_GUIDANCE = Math.min(2, Math.max(1, HUGGING_FACE_DEFAULT_GUIDANCE));
+const isPreviewBuild = (import.meta.env.VITE_VERCEL_ENV ?? '').toLowerCase() === 'preview';
+
+type ImageBatch = 'thumbnail' | 'inner';
+type SlotStatus = 'idle' | 'queued' | 'generating' | 'retrying' | 'done' | 'error';
+
+interface SlotGenerationState {
+  status: SlotStatus;
+  batch: ImageBatch;
+  attempts: number;
+  error?: string | null;
+  message?: string | null;
+}
 
 const getGenAIClient = () => {
   const apiKey = import.meta.env.VITE_GEMINI_API_KEY as string | undefined;
@@ -49,14 +72,15 @@ interface ImageConfig {
   height: number;
   aspectClass: string;
   isRemovable: boolean;
+  type: ImageBatch;
 }
 
 const SUPPORTED_ASPECT_RATIOS = ["1:1", "4:3", "3:4", "16:9", "9:16"];
 
 const HUGGING_FACE_MODELS = [
+  { value: 'stabilityai/sd-turbo', label: 'stabilityai/sd-turbo' },
   { value: 'runwayml/stable-diffusion-v1-5', label: 'runwayml/stable-diffusion-v1-5' },
   { value: 'stabilityai/stable-diffusion-2-1', label: 'stabilityai/stable-diffusion-2-1' },
-  { value: 'stabilityai/sd-turbo', label: 'stabilityai/sd-turbo' },
   { value: 'stabilityai/sdxl-turbo', label: 'stabilityai/sdxl-turbo (may require access)' },
 ];
 
@@ -108,11 +132,22 @@ const App = () => {
   const [currentVersions, setCurrentVersions] = useState<Record<string, number>>({});
   const [modificationPrompts, setModificationPrompts] = useState<Record<string, string>>({
     thumbnail16x9: '',
-    thumbnail4x3: '',
+    thumbnailAlt16x9: '',
     innerImage1: '',
     innerImage2: '',
   });
-  const [loading, setLoading] = useState(false);
+  const [slotStatuses, setSlotStatuses] = useState<Record<string, SlotGenerationState>>({
+    thumbnail16x9: { status: 'idle', batch: 'thumbnail', attempts: 0, error: null, message: null },
+    thumbnailAlt16x9: { status: 'idle', batch: 'thumbnail', attempts: 0, error: null, message: null },
+    innerImage1: { status: 'idle', batch: 'inner', attempts: 0, error: null, message: null },
+    innerImage2: { status: 'idle', batch: 'inner', attempts: 0, error: null, message: null },
+  });
+  const [isBatchRunning, setIsBatchRunning] = useState(false);
+  const [innerStarted, setInnerStarted] = useState(false);
+  const [innerSkipped, setInnerSkipped] = useState(false);
+  const [showSkipInnerLink, setShowSkipInnerLink] = useState(false);
+  const slotStatusesRef = useRef(slotStatuses);
+  const skipInnerRef = useRef(false);
   const [regenerating, setRegenerating] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [imageProvider, setImageProvider] = useState<'google' | 'huggingFace'>('google');
@@ -120,66 +155,113 @@ const App = () => {
   const [selectedModel, setSelectedModel] = useState('imagen-4.0-generate-001');
   const [modalState, setModalState] = useState<{ key: string; history: string[]; index: number } | null>(null);
   const isHuggingFaceProvider = imageProvider === 'huggingFace';
+  const hasFailures = useMemo(() => Object.values(slotStatuses).some(state => state.status === 'error'), [slotStatuses]);
 
-  const requestHuggingFaceImage = async (payload: Record<string, unknown>) => {
-    const response = await fetch('/api/hugging-face', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ ...payload, modelId: selectedHuggingFaceModel }),
+  useEffect(() => {
+    slotStatusesRef.current = slotStatuses;
+  }, [slotStatuses]);
+
+  useEffect(() => {
+    setSlotStatuses(prev => {
+      const next: Record<string, SlotGenerationState> = {};
+      imageConfigs.forEach(config => {
+        const existing = prev[config.key];
+        next[config.key] = existing
+          ? { ...existing, batch: config.type }
+          : { status: 'idle', batch: config.type, attempts: 0, error: null, message: null };
+      });
+      return next;
     });
+  }, [imageConfigs]);
 
-    const rawBody = await response.text();
-    let parsedBody: any = null;
-    if (rawBody) {
-      try {
-        parsedBody = JSON.parse(rawBody);
-      } catch (parseErr) {
-        console.warn('Failed to parse Hugging Face response as JSON', parseErr);
+  const requestHuggingFaceImage = async (
+    payload: Record<string, unknown>,
+    callbacks?: {
+      onAttemptStart?: (attempt: number) => void;
+      onRetry?: (nextAttempt: number, delayMs: number) => void;
+    },
+  ) => {
+    const maxAttempts = 3;
+    const retryDelays = [0, 1500, 2500];
+
+    const sendRequest = async (attempt: number): Promise<{ base64: string; contentType: string }> => {
+      callbacks?.onAttemptStart?.(attempt);
+
+      const response = await fetch('/api/hugging-face', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ ...payload, modelId: selectedHuggingFaceModel }),
+      });
+
+      const rawBody = await response.text();
+      let parsedBody: any = null;
+      if (rawBody) {
+        try {
+          parsedBody = JSON.parse(rawBody);
+        } catch (parseErr) {
+          console.warn('Failed to parse Hugging Face response as JSON', parseErr);
+        }
       }
-    }
 
-    if (!response.ok) {
-      const message = typeof parsedBody?.error === 'string'
-        ? parsedBody.error
-        : rawBody
-          ? rawBody.slice(0, 200)
-          : 'Failed to generate image with Hugging Face.';
-
-      if (response.status === 404) {
-        throw new Error('Model not found or gated — check the model page on Hugging Face and accept terms if required.');
+      const lowerBody = rawBody ? rawBody.toLowerCase() : '';
+      if (response.status === 503 && lowerBody.includes('loading')) {
+        if (attempt < maxAttempts) {
+          const delay = retryDelays[attempt] ?? retryDelays[retryDelays.length - 1];
+          callbacks?.onRetry?.(attempt + 1, delay);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          return sendRequest(attempt + 1);
+        }
+        const message = typeof parsedBody?.error === 'string'
+          ? parsedBody.error
+          : 'Model is loading. Please retry in a moment.';
+        throw new Error(message);
       }
 
-      throw new Error(message);
-    }
+      if (!response.ok) {
+        const message = typeof parsedBody?.error === 'string'
+          ? parsedBody.error
+          : rawBody
+            ? rawBody.slice(0, 200)
+            : 'Failed to generate image with Hugging Face.';
 
-    if (!parsedBody || typeof parsedBody !== 'object') {
-      throw new Error('Invalid response from Hugging Face.');
-    }
+        if (response.status === 404) {
+          throw new Error('Model not found or gated — check the model page on Hugging Face and accept terms if required.');
+        }
 
-    const base64 = typeof (parsedBody as { imageBase64?: string }).imageBase64 === 'string'
-      ? (parsedBody as { imageBase64: string }).imageBase64
-      : typeof (parsedBody as { image?: string }).image === 'string'
-        ? (parsedBody as { image: string }).image
-        : null;
+        throw new Error(message);
+      }
 
-    if (!base64) {
-      throw new Error('Invalid response from Hugging Face.');
-    }
+      if (!parsedBody || typeof parsedBody !== 'object') {
+        throw new Error('Invalid response from Hugging Face.');
+      }
 
-    const contentType = typeof (parsedBody as { contentType?: string }).contentType === 'string'
-      ? (parsedBody as { contentType: string }).contentType
-      : 'image/png';
+      const base64 = typeof (parsedBody as { imageBase64?: string }).imageBase64 === 'string'
+        ? (parsedBody as { imageBase64: string }).imageBase64
+        : typeof (parsedBody as { image?: string }).image === 'string'
+          ? (parsedBody as { image: string }).image
+          : null;
 
-    return { base64, contentType };
+      if (!base64) {
+        throw new Error('Invalid response from Hugging Face.');
+      }
+
+      const contentType = typeof (parsedBody as { contentType?: string }).contentType === 'string'
+        ? (parsedBody as { contentType: string }).contentType
+        : 'image/png';
+
+      return { base64, contentType };
+    };
+
+    return sendRequest(1);
   };
   
   const initialImageConfigs: ImageConfig[] = [
-    { key: 'thumbnail16x9', title: 'Thumbnail', width: 1280, height: 720, aspectClass: 'aspect-16-9', isRemovable: false },
-    { key: 'thumbnail4x3', title: 'Thumbnail', width: 812, height: 608, aspectClass: 'aspect-4-3', isRemovable: false },
-    { key: 'innerImage1', title: 'Inner Image', width: 1125, height: 580, aspectClass: 'aspect-16-9', isRemovable: false },
-    { key: 'innerImage2', title: 'Inner Image', width: 1125, height: 580, aspectClass: 'aspect-16-9', isRemovable: false },
+    { key: 'thumbnail16x9', title: 'Thumbnail', width: 1280, height: 720, aspectClass: 'aspect-16-9', isRemovable: false, type: 'thumbnail' },
+    { key: 'thumbnailAlt16x9', title: 'Thumbnail', width: 1024, height: 576, aspectClass: 'aspect-16-9', isRemovable: false, type: 'thumbnail' },
+    { key: 'innerImage1', title: 'Inner Image', width: 812, height: 608, aspectClass: 'aspect-4-3', isRemovable: false, type: 'inner' },
+    { key: 'innerImage2', title: 'Inner Image', width: 812, height: 608, aspectClass: 'aspect-4-3', isRemovable: false, type: 'inner' },
   ];
   const [imageConfigs, setImageConfigs] = useState<ImageConfig[]>(initialImageConfigs);
 
@@ -210,82 +292,364 @@ const App = () => {
   - **Overall Feel:** Product-centric, data-driven, clean, and user-friendly.
   `;
 
+  const logRequestTelemetry = (batch: ImageBatch, index: number, attempt: number, ms: number, status: 'ok' | 'error') => {
+    if (!isPreviewBuild) return;
+    console.log(JSON.stringify({ batch: batch === 'thumbnail' ? 'thumb' : 'inner', index, attempt, ms, status }));
+  };
+
+  const runHuggingFaceSlot = async (config: ImageConfig, batch: ImageBatch, basePrompt: string, index: number) => {
+    const ratio = findClosestSupportedRatio(config.width, config.height);
+    const prompt = `${basePrompt} Generate a single image that fits an aspect ratio of ${ratio}.`;
+    const startTime = performance.now();
+    let attempts = 0;
+
+    try {
+      const { base64, contentType } = await requestHuggingFaceImage(
+        {
+          prompt,
+          inputs: prompt,
+          width: config.width,
+          height: config.height,
+          aspectRatio: ratio,
+          parameters: {
+            width: config.width,
+            height: config.height,
+            guidance_scale: CLAMPED_HF_GUIDANCE,
+            num_inference_steps: CLAMPED_HF_STEPS,
+          },
+        },
+        {
+          onAttemptStart: attempt => {
+            attempts = attempt;
+            setSlotStatuses(prev => {
+              const existing = prev[config.key] ?? { status: 'idle', batch: config.type, attempts: 0, error: null, message: null };
+              return {
+                ...prev,
+                [config.key]: { ...existing, status: 'generating', attempts: attempt, error: null, message: null },
+              };
+            });
+          },
+          onRetry: (nextAttempt, delayMs) => {
+            setSlotStatuses(prev => {
+              const existing = prev[config.key] ?? { status: 'idle', batch: config.type, attempts, error: null, message: null };
+              return {
+                ...prev,
+                [config.key]: {
+                  ...existing,
+                  status: 'retrying',
+                  attempts,
+                  error: null,
+                  message: `Retrying in ${(delayMs / 1000).toFixed(1)}s...`,
+                },
+              };
+            });
+          },
+        },
+      );
+
+      const mimeType = contentType.includes('/') ? contentType : 'image/png';
+      const imageSrc = `data:${mimeType};base64,${base64}`;
+
+      setImages(prev => ({ ...prev, [config.key]: [imageSrc] }));
+      setCurrentVersions(prev => ({ ...prev, [config.key]: 0 }));
+      setSlotStatuses(prev => {
+        const existing = prev[config.key] ?? { status: 'idle', batch: config.type, attempts, error: null, message: null };
+        return {
+          ...prev,
+          [config.key]: { ...existing, status: 'done', attempts, error: null, message: null },
+        };
+      });
+
+      logRequestTelemetry(batch, index, attempts, Math.round(performance.now() - startTime), 'ok');
+    } catch (err) {
+      const message = parseErrorMessage(err);
+      const elapsed = Math.round(performance.now() - startTime);
+      setSlotStatuses(prev => {
+        const existing = prev[config.key] ?? { status: 'idle', batch: config.type, attempts: attempts || 1, error: null, message: null };
+        return {
+          ...prev,
+          [config.key]: {
+            ...existing,
+            status: 'error',
+            attempts: attempts || existing.attempts || 1,
+            error: message,
+            message: null,
+          },
+        };
+      });
+      logRequestTelemetry(batch, index, attempts || 1, elapsed, 'error');
+    }
+  };
+
+  const runGoogleSlot = async (
+    config: ImageConfig,
+    basePrompt: string,
+    index: number,
+    aiClient: GoogleGenAI,
+  ) => {
+    const ratio = findClosestSupportedRatio(config.width, config.height);
+    const prompt = `${basePrompt} Generate a single image that fits an aspect ratio of ${ratio}.`;
+
+    setSlotStatuses(prev => {
+      const existing = prev[config.key] ?? { status: 'idle', batch: config.type, attempts: 0, error: null, message: null };
+      return {
+        ...prev,
+        [config.key]: {
+          ...existing,
+          status: 'generating',
+          attempts: Math.max(existing.attempts + 1, 1),
+          error: null,
+          message: null,
+        },
+      };
+    });
+
+    try {
+      const response = await aiClient.models.generateImages({
+        model: 'imagen-4.0-generate-001',
+        prompt,
+        config: { numberOfImages: 1, outputMimeType: 'image/png', aspectRatio: ratio },
+      });
+      const imageBytes = response.generatedImages?.[0]?.image?.imageBytes;
+      if (!imageBytes) {
+        throw new Error('Image generation failed to return an image.');
+      }
+
+      const imageSrc = `data:image/png;base64,${imageBytes}`;
+      setImages(prev => ({ ...prev, [config.key]: [imageSrc] }));
+      setCurrentVersions(prev => ({ ...prev, [config.key]: 0 }));
+      setSlotStatuses(prev => {
+        const existing = prev[config.key] ?? { status: 'idle', batch: config.type, attempts: 1, error: null, message: null };
+        return {
+          ...prev,
+          [config.key]: { ...existing, status: 'done', error: null, message: null },
+        };
+      });
+    } catch (err) {
+      const message = parseErrorMessage(err);
+      setSlotStatuses(prev => {
+        const existing = prev[config.key] ?? { status: 'idle', batch: config.type, attempts: 1, error: null, message: null };
+        return {
+          ...prev,
+          [config.key]: { ...existing, status: 'error', error: message, message: null },
+        };
+      });
+      setError(message);
+    }
+  };
+
+  const runBatchForConfigs = async (
+    configs: ImageConfig[],
+    batch: ImageBatch,
+    basePrompt: string,
+    aiClient?: GoogleGenAI,
+  ) => {
+    if (!configs.length) return;
+
+    let cursor = 0;
+    const tasks = configs.map((config, index) => async () => {
+      if (batch === 'inner' && skipInnerRef.current) {
+        setSlotStatuses(prev => {
+          const existing = prev[config.key] ?? { status: 'idle', batch: config.type, attempts: 0, error: null, message: null };
+          return {
+            ...prev,
+            [config.key]: { ...existing, message: 'Skipped by user' },
+          };
+        });
+        return;
+      }
+
+      if (isHuggingFaceProvider) {
+        await runHuggingFaceSlot(config, batch, basePrompt, index);
+      } else if (aiClient) {
+        await runGoogleSlot(config, basePrompt, index, aiClient);
+      }
+    });
+
+    if (isHuggingFaceProvider) {
+      const workerCount = Math.min(HUGGING_FACE_MAX_CONCURRENCY, tasks.length);
+      const runners = Array.from({ length: workerCount }, () => (async () => {
+        while (true) {
+          const current = cursor++;
+          if (current >= tasks.length) {
+            break;
+          }
+          await tasks[current]();
+          if (batch === 'inner' && skipInnerRef.current) {
+            break;
+          }
+        }
+      })());
+      await Promise.all(runners);
+    } else {
+      for (const task of tasks) {
+        await task();
+        if (batch === 'inner' && skipInnerRef.current) {
+          break;
+        }
+      }
+    }
+  };
+
   const generateInitialImages = async () => {
     if (!blogContent.trim()) {
       setError('Please paste your blog content first.');
       return;
     }
+
     setError(null);
-    setLoading(true);
+    skipInnerRef.current = false;
+    setInnerSkipped(false);
+    setInnerStarted(false);
+    setShowSkipInnerLink(false);
     setImages({});
     setCurrentVersions({});
 
+    const thumbnailConfigs = imageConfigs.filter(config => config.type === 'thumbnail');
+    const innerConfigs = imageConfigs.filter(config => config.type === 'inner');
+
+    setSlotStatuses(() => {
+      const next: Record<string, SlotGenerationState> = {};
+      imageConfigs.forEach(config => {
+        next[config.key] = {
+          status: 'queued',
+          batch: config.type,
+          attempts: 0,
+          error: null,
+          message: config.type === 'inner' ? 'Waiting for thumbnails...' : null,
+        };
+      });
+      return next;
+    });
+
+    const basePrompt = `${STYLE_PROMPT} Based on the following blog content, generate images for a tech blog. Blog Content:"${blogContent}"`;
+    setIsBatchRunning(true);
+
+    const aiClient = isHuggingFaceProvider ? null : getGenAIClient();
+
     try {
-        if (isHuggingFaceProvider) {
-            const basePrompt = `${STYLE_PROMPT} Based on the following blog content, generate images for a tech blog. Blog Content:"${blogContent}"`;
-            const newImages: Record<string, string[]> = {};
+      await runBatchForConfigs(thumbnailConfigs, 'thumbnail', basePrompt, aiClient ?? undefined);
 
-            for (const config of imageConfigs) {
-                const ratio = findClosestSupportedRatio(config.width, config.height);
-                const prompt = `${basePrompt} Generate a single image that fits an aspect ratio of ${ratio}.`;
-                const { base64, contentType } = await requestHuggingFaceImage({
-                    prompt,
-                    width: config.width,
-                    height: config.height,
-                    aspectRatio: ratio,
-                });
-                const mimeType = contentType.includes('/') ? contentType : 'image/png';
-                newImages[config.key] = [`data:${mimeType};base64,${base64}`];
-            }
+      const thumbnailErrors = thumbnailConfigs.some(config => slotStatusesRef.current[config.key]?.status === 'error');
+      if (thumbnailErrors) {
+        setError('Some thumbnails failed. Use Retry failed to try again.');
+        return;
+      }
 
-            setImages(newImages);
+      if (innerConfigs.length > 0) {
+        setShowSkipInnerLink(true);
+        setInnerStarted(true);
+        await runBatchForConfigs(innerConfigs, 'inner', basePrompt, aiClient ?? undefined);
+        setShowSkipInnerLink(false);
 
-            const initialVersions: Record<string, number> = {};
-            Object.keys(newImages).forEach(key => initialVersions[key] = 0);
-            setCurrentVersions(initialVersions);
-            return;
+        if (skipInnerRef.current) {
+          setError(null);
+          return;
         }
 
-        const ai = getGenAIClient();
-        const basePrompt = `${STYLE_PROMPT} Based on the following blog content, generate images for a tech blog. Blog Content:"${blogContent}"`;
-
-        const groupedByAspectRatio = imageConfigs.reduce((acc, config) => {
-            const ratio = findClosestSupportedRatio(config.width, config.height);
-            if (!acc[ratio]) acc[ratio] = [];
-            acc[ratio].push(config);
-            return acc;
-        }, {} as Record<string, ImageConfig[]>);
-
-        const allGeneratedImages: { key: string, src: string }[] = [];
-
-        for (const ratio in groupedByAspectRatio) {
-            const configs = groupedByAspectRatio[ratio];
-            const prompt = `${basePrompt} Generate ${configs.length} different image(s).`;
-            const response = await ai.models.generateImages({
-                model: 'imagen-4.0-generate-001', prompt, config: { numberOfImages: configs.length, outputMimeType: 'image/png', aspectRatio: ratio },
-            });
-            response.generatedImages.forEach((img, index) => {
-                allGeneratedImages.push({
-                    key: configs[index].key,
-                    src: `data:image/png;base64,${img.image.imageBytes}`,
-                });
-            });
+        const innerErrors = innerConfigs.some(config => slotStatusesRef.current[config.key]?.status === 'error');
+        if (innerErrors) {
+          setError('Some inner images failed. Use Retry failed to re-run them.');
+          return;
         }
+      }
 
-        const newImages: Record<string, string[]> = {};
-        allGeneratedImages.forEach(({ key, src }) => newImages[key] = [src]);
-        setImages(newImages);
-
-        const initialVersions: Record<string, number> = {};
-        Object.keys(newImages).forEach(key => initialVersions[key] = 0);
-        setCurrentVersions(initialVersions);
-
+      setError(null);
     } catch (err) {
       console.error(err);
       setError(parseErrorMessage(err));
     } finally {
-      setLoading(false);
+      setIsBatchRunning(false);
     }
+  };
+
+  const retryFailedSlots = async () => {
+    const failedConfigs = imageConfigs.filter(config => slotStatuses[config.key]?.status === 'error');
+    if (failedConfigs.length === 0) {
+      return;
+    }
+
+    if (!blogContent.trim()) {
+      setError('Please paste your blog content first.');
+      return;
+    }
+
+    setError(null);
+    skipInnerRef.current = false;
+    setInnerSkipped(false);
+    setShowSkipInnerLink(false);
+    setIsBatchRunning(true);
+
+    const basePrompt = `${STYLE_PROMPT} Based on the following blog content, generate images for a tech blog. Blog Content:"${blogContent}"`;
+    const aiClient = isHuggingFaceProvider ? null : getGenAIClient();
+
+    const failedThumbnails = failedConfigs.filter(config => config.type === 'thumbnail');
+    const failedInner = failedConfigs.filter(config => config.type === 'inner');
+
+    try {
+      if (failedThumbnails.length > 0) {
+        setSlotStatuses(prev => {
+          const next = { ...prev };
+          failedThumbnails.forEach(config => {
+            next[config.key] = {
+              status: 'queued',
+              batch: config.type,
+              attempts: 0,
+              error: null,
+              message: null,
+            };
+          });
+          return next;
+        });
+
+        await runBatchForConfigs(failedThumbnails, 'thumbnail', basePrompt, aiClient ?? undefined);
+      }
+
+      const thumbnailsStillFailing = failedThumbnails.some(config => slotStatusesRef.current[config.key]?.status === 'error');
+
+      if (!thumbnailsStillFailing && failedInner.length > 0) {
+        setSlotStatuses(prev => {
+          const next = { ...prev };
+          failedInner.forEach(config => {
+            next[config.key] = {
+              status: 'queued',
+              batch: config.type,
+              attempts: 0,
+              error: null,
+              message: null,
+            };
+          });
+          return next;
+        });
+
+        setShowSkipInnerLink(true);
+        setInnerStarted(true);
+        await runBatchForConfigs(failedInner, 'inner', basePrompt, aiClient ?? undefined);
+        setShowSkipInnerLink(false);
+
+        if (skipInnerRef.current) {
+          setError(null);
+          return;
+        }
+      }
+
+      const remainingFailures = failedConfigs.some(config => slotStatusesRef.current[config.key]?.status === 'error');
+      setError(remainingFailures ? 'Some images are still failing. Adjust your prompts and try again.' : null);
+    } catch (err) {
+      console.error(err);
+      setError(parseErrorMessage(err));
+    } finally {
+      setIsBatchRunning(false);
+    }
+  };
+
+  const handleSkipInner = () => {
+    if (!innerStarted) {
+      return;
+    }
+    skipInnerRef.current = true;
+    setInnerSkipped(true);
+    setShowSkipInnerLink(false);
   };
 
   const regenerateImage = async (imageKey: string) => {
@@ -304,6 +668,15 @@ const App = () => {
         return;
     }
     const aspectRatio = findClosestSupportedRatio(config.width, config.height);
+    let attempts = 0;
+
+    setSlotStatuses(prev => {
+      const existing = prev[imageKey] ?? { status: 'idle', batch: config.type, attempts: 0, error: null, message: null };
+      return {
+        ...prev,
+        [imageKey]: { ...existing, status: 'generating', attempts: Math.max(existing.attempts + 1, 1), error: null, message: null },
+      };
+    });
 
     try {
         let newImageSrc: string | null = null;
@@ -316,9 +689,42 @@ const App = () => {
 
             const { base64, contentType } = await requestHuggingFaceImage({
                 prompt,
+                inputs: prompt,
                 width: config.width,
                 height: config.height,
                 aspectRatio,
+                parameters: {
+                  width: config.width,
+                  height: config.height,
+                  guidance_scale: CLAMPED_HF_GUIDANCE,
+                  num_inference_steps: CLAMPED_HF_STEPS,
+                },
+            }, {
+              onAttemptStart: attempt => {
+                attempts = attempt;
+                setSlotStatuses(prev => {
+                  const existing = prev[imageKey] ?? { status: 'idle', batch: config.type, attempts: 0, error: null, message: null };
+                  return {
+                    ...prev,
+                    [imageKey]: { ...existing, status: 'generating', attempts: attempt, error: null, message: null },
+                  };
+                });
+              },
+              onRetry: (_nextAttempt, delayMs) => {
+                setSlotStatuses(prev => {
+                  const existing = prev[imageKey] ?? { status: 'idle', batch: config.type, attempts, error: null, message: null };
+                  return {
+                    ...prev,
+                    [imageKey]: {
+                      ...existing,
+                      status: 'retrying',
+                      attempts,
+                      error: null,
+                      message: `Retrying in ${(delayMs / 1000).toFixed(1)}s...`,
+                    },
+                  };
+                });
+              },
             });
             const mimeType = contentType.includes('/') ? contentType : 'image/png';
             newImageSrc = `data:${mimeType};base64,${base64}`;
@@ -371,11 +777,28 @@ const App = () => {
                 return { ...prev, [imageKey]: [...newHistory, newImageSrc as string] };
             });
             setCurrentVersions(prev => ({...prev, [imageKey]: (prev[imageKey] ?? -1) + 1}));
+            setSlotStatuses(prev => {
+              const fallback: SlotGenerationState = { status: 'idle', batch: config.type, attempts: 0, error: null, message: null };
+              const existing = prev[imageKey] ?? fallback;
+              const nextAttempts = attempts || existing.attempts || 1;
+              return {
+                ...prev,
+                [imageKey]: { ...existing, status: 'done', attempts: nextAttempts, error: null, message: null },
+              };
+            });
         }
 
     } catch (err) {
         console.error(err);
-        setError(parseErrorMessage(err));
+        const message = parseErrorMessage(err);
+        setError(message);
+        setSlotStatuses(prev => {
+          const existing = prev[imageKey] ?? { status: 'idle', batch: config.type, attempts: attempts || 1, error: null, message: null };
+          return {
+            ...prev,
+            [imageKey]: { ...existing, status: 'error', attempts: attempts || existing.attempts || 1, error: message, message: null },
+          };
+        });
     } finally {
         setRegenerating(null);
     }
@@ -396,15 +819,57 @@ const App = () => {
         return;
     }
     const aspectRatio = findClosestSupportedRatio(config.width, config.height);
+    let attempts = 0;
+
+    setSlotStatuses(prev => {
+      const existing = prev[imageKey] ?? { status: 'idle', batch: config.type, attempts: 0, error: null, message: null };
+      return {
+        ...prev,
+        [imageKey]: { ...existing, status: 'generating', attempts: Math.max(existing.attempts + 1, 1), error: null, message: null },
+      };
+    });
 
     try {
         if (isHuggingFaceProvider) {
             const prompt = `${STYLE_PROMPT} Based on the following blog content, generate an image for a tech blog. Blog Content: "${blogContent}"`;
             const { base64, contentType } = await requestHuggingFaceImage({
                 prompt,
+                inputs: prompt,
                 width: config.width,
                 height: config.height,
                 aspectRatio,
+                parameters: {
+                  width: config.width,
+                  height: config.height,
+                  guidance_scale: CLAMPED_HF_GUIDANCE,
+                  num_inference_steps: CLAMPED_HF_STEPS,
+                },
+            }, {
+              onAttemptStart: attempt => {
+                attempts = attempt;
+                setSlotStatuses(prev => {
+                  const existing = prev[imageKey] ?? { status: 'idle', batch: config.type, attempts: 0, error: null, message: null };
+                  return {
+                    ...prev,
+                    [imageKey]: { ...existing, status: 'generating', attempts: attempt, error: null, message: null },
+                  };
+                });
+              },
+              onRetry: (_nextAttempt, delayMs) => {
+                setSlotStatuses(prev => {
+                  const existing = prev[imageKey] ?? { status: 'idle', batch: config.type, attempts, error: null, message: null };
+                  return {
+                    ...prev,
+                    [imageKey]: {
+                      ...existing,
+                      status: 'retrying',
+                      attempts,
+                      error: null,
+                      message: `Retrying in ${(delayMs / 1000).toFixed(1)}s...`,
+                    },
+                  };
+                });
+              },
             });
             const mimeType = contentType.includes('/') ? contentType : 'image/png';
             const newImageSrc = `data:${mimeType};base64,${base64}`;
@@ -414,6 +879,13 @@ const App = () => {
                 [imageKey]: [newImageSrc]
             }));
             setCurrentVersions(prev => ({...prev, [imageKey]: 0}));
+            setSlotStatuses(prev => {
+              const existing = prev[imageKey] ?? { status: 'idle', batch: config.type, attempts, error: null, message: null };
+              return {
+                ...prev,
+                [imageKey]: { ...existing, status: 'done', attempts: attempts || existing.attempts || 1, error: null, message: null },
+              };
+            });
             return;
         }
 
@@ -433,13 +905,28 @@ const App = () => {
                 [imageKey]: [newImageSrc]
             }));
             setCurrentVersions(prev => ({...prev, [imageKey]: 0}));
+            setSlotStatuses(prev => {
+              const existing = prev[imageKey] ?? { status: 'idle', batch: config.type, attempts: 1, error: null, message: null };
+              return {
+                ...prev,
+                [imageKey]: { ...existing, status: 'done', error: null, message: null },
+              };
+            });
         } else {
             throw new Error("Image generation failed to return an image.");
         }
 
     } catch (err) {
         console.error(err);
-        setError(parseErrorMessage(err));
+        const message = parseErrorMessage(err);
+        setError(message);
+        setSlotStatuses(prev => {
+          const existing = prev[imageKey] ?? { status: 'idle', batch: config.type, attempts: attempts || 1, error: null, message: null };
+          return {
+            ...prev,
+            [imageKey]: { ...existing, status: 'error', attempts: attempts || existing.attempts || 1, error: message, message: null },
+          };
+        });
     } finally {
         setRegenerating(null);
     }
@@ -460,13 +947,18 @@ const App = () => {
     const newImage: ImageConfig = {
       key: newKey,
       title: 'Inner Image',
-      width: 1125,
-      height: 580,
-      aspectClass: 'aspect-16-9',
+      width: 812,
+      height: 608,
+      aspectClass: 'aspect-4-3',
       isRemovable: true,
+      type: 'inner',
     };
     setImageConfigs(prev => [...prev, newImage]);
     setModificationPrompts(prev => ({...prev, [newKey]: ''}));
+    setSlotStatuses(prev => ({
+      ...prev,
+      [newKey]: { status: 'idle', batch: 'inner', attempts: 0, error: null, message: null },
+    }));
   };
 
   const removeInnerImage = (keyToRemove: string) => {
@@ -486,6 +978,11 @@ const App = () => {
       const newState = {...prev};
       delete newState[keyToRemove];
       return newState;
+    });
+    setSlotStatuses(prev => {
+      const next = { ...prev };
+      delete next[keyToRemove];
+      return next;
     });
   };
 
@@ -538,7 +1035,7 @@ const App = () => {
                   className="model-selector"
                   value={imageProvider}
                   onChange={e => setImageProvider(e.target.value as 'google' | 'huggingFace')}
-                  disabled={loading || !!regenerating}
+                  disabled={isBatchRunning || !!regenerating}
               >
                   <option value="google">Google Gemini</option>
                   <option value="huggingFace">Hugging Face</option>
@@ -554,7 +1051,7 @@ const App = () => {
                 className="model-selector"
                 value={selectedHuggingFaceModel}
                 onChange={e => setSelectedHuggingFaceModel(e.target.value)}
-                disabled={loading || !!regenerating}
+                disabled={isBatchRunning || !!regenerating}
               >
                 {HUGGING_FACE_MODELS.map(model => (
                   <option key={model.value} value={model.value}>{model.label}</option>
@@ -572,7 +1069,7 @@ const App = () => {
                     className="model-selector"
                     value={selectedModel}
                     onChange={e => setSelectedModel(e.target.value)}
-                    disabled={loading || !!regenerating}
+                    disabled={isBatchRunning || !!regenerating}
                 >
                     <option value="imagen-4.0-generate-001">Imagen 4.0 (Generate)</option>
                     <option value="gemini-2.5-flash-image-preview">Gemini 2.5 Flash (Edit)</option>
@@ -587,17 +1084,45 @@ const App = () => {
           placeholder="Paste your blog document info here..."
           aria-label="Blog Content Input"
         />
-        <button className="btn btn-primary" onClick={generateInitialImages} disabled={loading}>
-          {loading ? <><div className="spinner"></div><span>Generating...</span></> : 'Generate Thumbnails'}
-        </button>
+        <div className="batch-controls">
+          <button className="btn btn-primary" onClick={generateInitialImages} disabled={isBatchRunning || !!regenerating}>
+            {isBatchRunning ? <><div className="spinner"></div><span>Generating...</span></> : 'Generate Thumbnails'}
+          </button>
+          <button
+            className="btn btn-secondary"
+            onClick={retryFailedSlots}
+            disabled={!hasFailures || isBatchRunning || !!regenerating}
+          >
+            Retry failed
+          </button>
+          {showSkipInnerLink && !innerSkipped && (
+            <button
+              type="button"
+              className="skip-inner-link"
+              onClick={handleSkipInner}
+              disabled={!!regenerating}
+            >
+              Skip inner images
+            </button>
+          )}
+        </div>
       </div>
+      {innerSkipped && <p className="info-message">Inner image batch skipped.</p>}
       {error && <p className="error-message" role="alert">{error}</p>}
       <div className="image-grid">
-        {imageConfigs.map(({ key, title, width, height, aspectClass, isRemovable }) => {
+        {imageConfigs.map(({ key, title, width, height, aspectClass, isRemovable, type }) => {
           const history = images[key] || [];
           const currentIndex = currentVersions[key] ?? -1;
           const currentImageSrc = history[currentIndex];
           const canUndo = currentIndex > 0;
+          const slotState = slotStatuses[key] ?? { status: 'idle', batch: type, attempts: 0, error: null, message: null };
+          const statusLabel = slotState.status.charAt(0).toUpperCase() + slotState.status.slice(1);
+          const showBatchSpinner = slotState.status === 'generating' || slotState.status === 'retrying';
+          const placeholderMessage = slotState.error
+            ? `${statusLabel}: ${slotState.error}`
+            : slotState.message
+              ? `${statusLabel}: ${slotState.message}`
+              : `${statusLabel}${slotState.status === 'idle' ? ' – awaiting generation' : ''}`;
 
           return (
             <div key={key} className="image-card">
@@ -614,10 +1139,19 @@ const App = () => {
                 {history.length > 0 && <span className="version-info">Version {currentIndex + 1} / {history.length}</span>}
               </div>
               <div className={`image-container ${aspectClass}`} style={{aspectRatio: `${width} / ${height}`}}>
-                {(loading || regenerating === key) && (
+                {((showBatchSpinner && isBatchRunning) || regenerating === key) && (
                   <div className="loading-overlay"><div className="spinner"></div></div>
                 )}
-                {currentImageSrc ? <img src={currentImageSrc} alt={title} /> : (!loading && <span className="placeholder-text">Image will appear here</span>)}
+                {currentImageSrc
+                  ? <img src={currentImageSrc} alt={title} />
+                  : <span className="placeholder-text">{placeholderMessage}</span>}
+              </div>
+              <div className={`slot-status slot-status-${slotState.status}`}>
+                <span className="slot-status-label">{statusLabel}</span>
+                {slotState.message && <span className="slot-status-message"> · {slotState.message}</span>}
+                {slotState.status === 'error' && slotState.error && (
+                  <span className="slot-status-error"> · {slotState.error}</span>
+                )}
               </div>
               <div className="image-actions">
                 <button className="btn btn-secondary" onClick={() => setModalState({ key, history, index: currentIndex })} disabled={!currentImageSrc}>View</button>
@@ -632,12 +1166,12 @@ const App = () => {
                   value={modificationPrompts[key] || ''}
                   onChange={(e) => handlePromptChange(e, key)}
                   aria-label={`Modification prompt for ${title}`}
-                  disabled={loading || !!regenerating || !currentImageSrc}
+                  disabled={isBatchRunning || !!regenerating || !currentImageSrc}
                 />
                 <button
                   className="btn btn-secondary"
                   onClick={() => currentImageSrc ? regenerateImage(key) : generateSingleImage(key)}
-                  disabled={loading || !!regenerating}
+                  disabled={isBatchRunning || !!regenerating}
                 >
                   {currentImageSrc ? 'Regenerate' : 'Generate'}
                 </button>
@@ -646,7 +1180,7 @@ const App = () => {
           )
         })}
       </div>
-      <button className="btn btn-primary add-image-btn" onClick={addInnerImage} disabled={loading || !!regenerating}>
+      <button className="btn btn-primary add-image-btn" onClick={addInnerImage} disabled={isBatchRunning || !!regenerating}>
         + Add Inner Image
       </button>
     </div>
