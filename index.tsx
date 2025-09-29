@@ -136,6 +136,13 @@ const App = () => {
     innerImage1: '',
     innerImage2: '',
   });
+  const initialImageConfigs: ImageConfig[] = [
+    { key: 'thumbnail16x9', title: 'Thumbnail', width: 1280, height: 720, aspectClass: 'aspect-16-9', isRemovable: false, type: 'thumbnail' },
+    { key: 'thumbnailAlt16x9', title: 'Thumbnail', width: 1024, height: 576, aspectClass: 'aspect-16-9', isRemovable: false, type: 'thumbnail' },
+    { key: 'innerImage1', title: 'Inner Image', width: 812, height: 608, aspectClass: 'aspect-4-3', isRemovable: false, type: 'inner' },
+    { key: 'innerImage2', title: 'Inner Image', width: 812, height: 608, aspectClass: 'aspect-4-3', isRemovable: false, type: 'inner' },
+  ];
+  const [imageConfigs, setImageConfigs] = useState<ImageConfig[]>(initialImageConfigs);
   const [slotStatuses, setSlotStatuses] = useState<Record<string, SlotGenerationState>>({
     thumbnail16x9: { status: 'idle', batch: 'thumbnail', attempts: 0, error: null, message: null },
     thumbnailAlt16x9: { status: 'idle', batch: 'thumbnail', attempts: 0, error: null, message: null },
@@ -257,14 +264,6 @@ const App = () => {
     return sendRequest(1);
   };
   
-  const initialImageConfigs: ImageConfig[] = [
-    { key: 'thumbnail16x9', title: 'Thumbnail', width: 1280, height: 720, aspectClass: 'aspect-16-9', isRemovable: false, type: 'thumbnail' },
-    { key: 'thumbnailAlt16x9', title: 'Thumbnail', width: 1024, height: 576, aspectClass: 'aspect-16-9', isRemovable: false, type: 'thumbnail' },
-    { key: 'innerImage1', title: 'Inner Image', width: 812, height: 608, aspectClass: 'aspect-4-3', isRemovable: false, type: 'inner' },
-    { key: 'innerImage2', title: 'Inner Image', width: 812, height: 608, aspectClass: 'aspect-4-3', isRemovable: false, type: 'inner' },
-  ];
-  const [imageConfigs, setImageConfigs] = useState<ImageConfig[]>(initialImageConfigs);
-
   const STYLE_PROMPT = `
   **Style Guide:** Create clean, modern, and product-focused images for a B2B SaaS blog. The aesthetic is centered on stylized UI mockups, data visualizations, and well-integrated human elements.
 
