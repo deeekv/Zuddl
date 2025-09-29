@@ -1,5 +1,7 @@
 import { Buffer } from 'buffer';
 
+export const config = { runtime: 'nodejs', maxDuration: 60 };
+
 type JsonRecord = Record<string, unknown>;
 
 const jsonResponse = (data: JsonRecord, status = 200) =>
@@ -12,12 +14,27 @@ const jsonResponse = (data: JsonRecord, status = 200) =>
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-const fetchWithRetry = async (url: string, options: RequestInit, attempt = 0): Promise<Response> => {
+const RETRY_DELAYS = [1500, 2500];
+const isPreviewEnv = (process.env.VERCEL_ENV ?? '').toLowerCase() === 'preview';
+
+const fetchWithRetry = async (url: string, options: RequestInit, attempt = 1): Promise<Response> => {
   const response = await fetch(url, options);
-  if (response.status === 503 && attempt === 0) {
-    await sleep(1500);
-    return fetchWithRetry(url, options, attempt + 1);
+
+  if (response.status === 503) {
+    const errorText = await response.text();
+    const isModelLoading = /loading/i.test(errorText);
+
+    if (isModelLoading && attempt <= RETRY_DELAYS.length) {
+      await sleep(RETRY_DELAYS[attempt - 1]);
+      return fetchWithRetry(url, options, attempt + 1);
+    }
+
+    return new Response(errorText, {
+      status: response.status,
+      headers: response.headers,
+    });
   }
+
   return response;
 };
 
@@ -53,8 +70,16 @@ export default async function handler(request: Request): Promise<Response> {
   const [org, name] = normalizedModelId.split('/');
   const requestUrl = `https://api-inference.huggingface.co/models/${encodeURIComponent(org)}/${encodeURIComponent(name)}`;
 
+  if (isPreviewEnv) {
+    const maskedToken = token.length > 4 ? `${token.slice(0, 4)}***` : '***';
+    console.log(`[hf] ${requestUrl} (token ${maskedToken})`);
+  }
+
   const { modelId: _modelId, ...forwardPayload } = payload;
   const body = JSON.stringify(forwardPayload);
+
+  const controller = new AbortController();
+  const abortTimer = setTimeout(() => controller.abort(), 55_000);
 
   let hfResponse: Response;
   try {
@@ -66,10 +91,17 @@ export default async function handler(request: Request): Promise<Response> {
         Accept: 'application/json, image/png',
       },
       body,
+      signal: controller.signal,
     });
   } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      console.error('Hugging Face request aborted due to timeout');
+      return jsonResponse({ error: 'Request timed out. Try again.' }, 504);
+    }
     console.error('Failed to reach Hugging Face Inference API', err);
     return jsonResponse({ error: 'Failed to reach Hugging Face Inference API' }, 502);
+  } finally {
+    clearTimeout(abortTimer);
   }
 
   const contentType = hfResponse.headers.get('content-type') ?? '';
